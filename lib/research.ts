@@ -82,56 +82,56 @@ async function fetchDDGInstantAnswer(domain: string): Promise<string> {
   } catch { return '' }
 }
 
-async function searchDDG(query: string, cap = 2000): Promise<string> {
+async function fetchGoogleNewsRSS(query: string, cap = 2000): Promise<string> {
   try {
     const q = encodeURIComponent(query)
-    const html = await fetchText(`https://html.duckduckgo.com/html/?q=${q}`)
-    if (!html) return ''
+    const xml = await fetchText(`https://news.google.com/rss/search?q=${q}&hl=en&gl=US&ceid=US:en`)
+    if (!xml || xml.length < 200) return ''
     const items: string[] = []
-    const titleRe   = /<a class="result__a"[^>]*>([\s\S]*?)<\/a>/g
-    const snippetRe = /<(?:span|a) class="result__snippet"[^>]*>([\s\S]*?)<\/(?:span|a)>/g
+    const itemRe = /<item>([\s\S]*?)<\/item>/g
     let m: RegExpExecArray | null
-    while ((m = titleRe.exec(html)) !== null) {
-      const t = stripHtml(m[1], 150)
-      if (t) items.push(t)
+    while ((m = itemRe.exec(xml)) !== null) {
+      const titleMatch = m[1].match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/)
+        ?? m[1].match(/<title>([\s\S]*?)<\/title>/)
+      const descMatch  = m[1].match(/<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/)
+        ?? m[1].match(/<description>([\s\S]*?)<\/description>/)
+      const title = titleMatch ? stripHtml(titleMatch[1], 150).trim() : ''
+      const desc  = descMatch  ? stripHtml(descMatch[1],  250).trim() : ''
+      if (title) items.push(desc ? `${title}: ${desc}` : title)
+      if (items.length >= 6) break
     }
-    while ((m = snippetRe.exec(html)) !== null) {
-      const s = stripHtml(m[1], 300)
-      if (s) items.push(s)
-    }
-    return items.slice(0, 10).join('\n').slice(0, cap)
+    return items.join('\n').slice(0, cap)
   } catch { return '' }
 }
 
-async function scrapeCrunchbase(domain: string): Promise<string> {
+async function fetchLinkedIn(domain: string): Promise<string> {
   const slug = domain.replace(/^www\./, '').split('.')[0]
   try {
-    const html = await fetchText(`https://www.crunchbase.com/organization/${slug}`)
-    if (!html || html.length < 500) return ''
-    const descMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]{20,500})"/)
-    return descMatch ? `Crunchbase: ${descMatch[1]}` : ''
+    const html = await fetchText(`https://www.linkedin.com/company/${slug}/about`)
+    if (!html || html.length < 300) return ''
+    const descMatch = html.match(/<meta[^>]+name="description"[^>]+content="([^"]{30,800})"/)
+    return descMatch ? `LinkedIn: ${descMatch[1]}` : ''
   } catch { return '' }
 }
 
 export async function researchCompany(url: string, domain: string): Promise<ResearchPacket> {
   const companyName = domain.replace(/^www\./, '').split('.')[0]
 
-  const [siteResult, instantAnswer, crunchbase, competitorSearch, newsSearch, startupSearch] = await Promise.all([
+  const [siteResult, instantAnswer, linkedIn, competitorNews, fundingNews] = await Promise.all([
     fetchSitePages(url),
     fetchDDGInstantAnswer(domain),
-    scrapeCrunchbase(domain),
-    searchDDG(`${companyName} competitors alternatives vs`),
-    searchDDG(`${companyName} ${domain} funding news 2024 2025`),
-    searchDDG(`"${companyName}" (crunchbase OR linkedin OR techcrunch OR yourstory OR economictimes OR tracxn)`),
+    fetchLinkedIn(domain),
+    fetchGoogleNewsRSS(`${companyName} competitors alternatives market`),
+    fetchGoogleNewsRSS(`"${companyName}" funding investment launch product`),
   ])
 
-  const enrichmentParts = [instantAnswer, crunchbase, startupSearch].filter(Boolean)
+  const enrichmentParts = [instantAnswer, linkedIn].filter(Boolean)
 
   return {
     siteContent:       siteResult.content,
     enrichment:        enrichmentParts.join('\n\n'),
-    competitorContext: competitorSearch,
-    newsContext:       newsSearch,
+    competitorContext: competitorNews,
+    newsContext:       fundingNews,
     sources:           siteResult.sources,
   }
 }
