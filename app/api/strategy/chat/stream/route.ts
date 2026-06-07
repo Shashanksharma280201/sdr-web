@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { spawn } from 'child_process'
 import sql from '@/lib/db'
 import { ensureSchema } from '../../sessions/route'
+import { researchCompany, formatResearchForPrompt, type ResearchPacket } from '@/lib/research'
 
 type ArtifactConfirmedState = {
   company_profiler?:       { confirmed: boolean; data: Record<string, unknown> | null }
@@ -27,64 +28,12 @@ const REGISTRY   = '/home/shanks/Videos/swarmstudio-cli-1.1.0-linux-amd64/swarm-
 const FLOW_ID    = 'sdr:core:profile-builder'
 const WORKSPACE  = 'ws-09Dymwpl'
 
-// ─── Web scraping ──────────────────────────────────────────────────────────────
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/\s{3,}/g, '\n')
-    .trim()
-    .slice(0, 6000)  // cap at 6k chars
-}
-
-async function fetchWebsite(url: string): Promise<string> {
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SDRBot/1.0)' },
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!res.ok) return ''
-    const html = await res.text()
-    return stripHtml(html)
-  } catch { return '' }
-}
-
 function extractUrl(text: string): string | null {
   const m = text.match(/https?:\/\/[^\s]+/)
   if (m) return m[0].replace(/[.,;!?)]+$/, '')
   // bare domain like "flomobility.com"
   const d = text.match(/\b([a-zA-Z0-9-]+\.(?:com|io|ai|co|net|org|app)(?:\/\S*)?)\b/)
   return d ? `https://${d[1]}` : null
-}
-
-// ─── Clay enrichment (bonus layer if API key set) ──────────────────────────────
-async function clayEnrich(domain: string): Promise<string> {
-  if (!process.env.CLAY_API_KEY) return ''
-  try {
-    const res = await fetch('https://mcp.clay.run/v1/tools/mcp__clay__enrich_company', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.CLAY_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain }),
-      signal: AbortSignal.timeout(6000),
-    })
-    if (!res.ok) return ''
-    const data = await res.json()
-    const c = data?.result?.content?.[0]?.text ? JSON.parse(data.result.content[0].text) : data
-    const parts: string[] = []
-    if (c.company_name)      parts.push(`Company: ${c.company_name}`)
-    if (c.industry)          parts.push(`Industry: ${c.industry}`)
-    if (c.employee_count)    parts.push(`Size: ~${c.employee_count} employees`)
-    if (c.funding_stage)     parts.push(`Funding: ${c.funding_stage}`)
-    if (c.description)       parts.push(`Description: ${c.description}`)
-    if (c.tech_stack?.length) parts.push(`Tech Stack: ${(c.tech_stack as string[]).slice(0, 5).join(', ')}`)
-    return parts.length ? `\n\nClay Enrichment:\n${parts.join('\n')}` : ''
-  } catch { return '' }
 }
 
 function extractDomain(text: string): string | null {
@@ -236,54 +185,70 @@ export async function POST(req: NextRequest) {
 
   await ensureSchema()
 
-  // Load history
-  const history = await sql<{ role: string; content: string }[]>`
-    SELECT role, content FROM strategy_chats
-    WHERE session_id = ${session_id}
-    ORDER BY created_at ASC
-    LIMIT 60
-  `
-
-  // Persist user message
+  // Persist user message first so it appears in the history load below
   await sql`
     INSERT INTO strategy_chats (session_id, agent_name, role, content)
     VALUES (${session_id}, ${agent ?? 'profile_builder_web'}, 'user', ${message})
   `
 
-  // Auto-title from first message
-  if (history.length === 0) {
+  // Load history and artifact state in parallel
+  const [historyRows, sessionRows] = await Promise.all([
+    sql<{ role: string; content: string }[]>`
+      SELECT role, content FROM strategy_chats
+      WHERE session_id = ${session_id}
+      ORDER BY created_at ASC
+      LIMIT 60
+    `,
+    sql<{ artifact_state: ArtifactConfirmedState | null }[]>`
+      SELECT artifact_state FROM strategy_sessions WHERE id = ${session_id}
+    `,
+  ])
+
+  const history      = historyRows
+  const artifactState: ArtifactConfirmedState = (sessionRows[0]?.artifact_state as ArtifactConfirmedState) ?? {}
+
+  // Auto-title session from first user message
+  if (history.length <= 1) {
     const title = message.length > 50 ? message.slice(0, 47) + '…' : message
     await sql`UPDATE strategy_sessions SET title = ${title}, updated_at = NOW() WHERE id = ${session_id} AND title = 'New Analysis'`
   } else {
     await sql`UPDATE strategy_sessions SET updated_at = NOW() WHERE id = ${session_id}`
   }
 
-  // Research the company: fetch website + Clay enrichment
-  const allText = [...history.map(h => h.content), message].join(' ')
+  // Research the company from all messages so far
+  const allText = history.map(h => h.content).join(' ')
   const url    = extractUrl(allText)
   const domain = extractDomain(allText)
 
-  const [webContent, clayData] = await Promise.all([
-    url ? fetchWebsite(url) : Promise.resolve(''),
-    domain ? clayEnrich(domain) : Promise.resolve(''),
-  ])
+  let researchSummary = ''
+  if (url && domain) {
+    const packet = await researchCompany(url, domain)
+    researchSummary = formatResearchForPrompt(packet, url)
+  } else if (url) {
+    try {
+      const html = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(6000) }).then(r => r.text()).catch(() => '')
+      researchSummary = html ? `Website content:\n${html.replace(/<[^>]+>/g, ' ').replace(/\s{3,}/g, '\n').trim().slice(0, 6000)}` : ''
+    } catch { researchSummary = '' }
+  }
 
-  const researchBlock = [
-    webContent ? `\n\nWebsite content from ${url}:\n${webContent}` : '',
-    clayData,
-  ].join('')
+  // Build dynamic system prompt with research + current artifact state
+  const systemPrompt = buildSystemPrompt(researchSummary, artifactState)
 
-  // Build prompt for Claude
-  const historyText = history.length > 0
-    ? '\n\nConversation so far:\n' + history.map(r => `${r.role === 'user' ? 'User' : 'Assistant'}: ${r.content}`).join('\n\n')
+  const historyText = history.length > 1
+    ? '\n\nConversation so far:\n' + history.slice(0, -1).map(r => `${r.role === 'user' ? 'User' : 'Assistant'}: ${r.content}`).join('\n\n')
     : ''
-  const fullPrompt = `${SYSTEM_PROMPT}${researchBlock}${historyText}\n\nUser: ${message}\n\nAssistant:`
+
+  const fullPrompt = `${systemPrompt}${historyText}\n\nUser: ${message}\n\nAssistant:`
 
   let fullContent = ''
 
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder()
+
+      if (domain) {
+        controller.enqueue(enc.encode(`data: ${JSON.stringify({ event: 'researching', domain })}\n\n`))
+      }
 
       const proc = spawn(
         '/home/shanks/.local/bin/claude',
@@ -344,7 +309,6 @@ export async function POST(req: NextRequest) {
             if ((d.key_features as string[])?.length) parts.push(`Key Features: ${(d.key_features as string[]).join(', ')}`)
             if ((d.differentiators as string[])?.length) parts.push(`Differentiators: ${(d.differentiators as string[]).join(', ')}`)
             if ((d.target_outcomes as string[])?.length) parts.push(`Target Outcomes: ${(d.target_outcomes as string[]).join(', ')}`)
-            if (clayData) parts.push(clayData)
             // Append conversation history for full context
             const histCtx = history.map(r => `${r.role === 'user' ? 'User' : 'AI'}: ${r.content}`).join('\n')
             if (histCtx) parts.push('\nConversation:\n' + histCtx)
@@ -366,6 +330,20 @@ export async function POST(req: NextRequest) {
             await sql`
               UPDATE strategy_sessions
               SET context_text = ${accumulatedContext}, pipeline_task_id = ${lastTaskId}, updated_at = NOW()
+              WHERE id = ${session_id}
+            `
+          }
+
+          // Persist confirmed artifact state
+          if (stageSignals.length > 0) {
+            const updatedState: ArtifactConfirmedState = { ...artifactState }
+            for (const sig of stageSignals) {
+              const key = sig.stage as keyof ArtifactConfirmedState
+              updatedState[key] = { confirmed: true, data: sig.data }
+            }
+            await sql`
+              UPDATE strategy_sessions
+              SET artifact_state = ${JSON.stringify(updatedState)}, updated_at = NOW()
               WHERE id = ${session_id}
             `
           }
