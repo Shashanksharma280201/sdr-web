@@ -34,22 +34,26 @@ function stripHtml(html: string, cap = 4000): string {
 const SUB_PAGES = ['/about', '/product', '/products', '/solutions', '/pricing', '/customers', '/careers']
 
 async function fetchSitePages(baseUrl: string): Promise<{ content: string; sources: string[] }> {
-  const homepageHtml = await fetchText(baseUrl)
-  const homepage = stripHtml(homepageHtml, 3000)
+  try {
+    const homepageHtml = await fetchText(baseUrl)
+    const homepage = stripHtml(homepageHtml, 3000)
 
-  const subResults = await Promise.all(
-    SUB_PAGES.map(async (path) => {
-      const url = baseUrl.replace(/\/$/, '') + path
-      const html = await fetchText(url)
-      const text = stripHtml(html, 2000)
-      return { url, text }
-    })
-  )
+    const subResults = await Promise.all(
+      SUB_PAGES.map(async (path) => {
+        const url = baseUrl.replace(/\/$/, '') + path
+        const html = await fetchText(url)
+        const text = stripHtml(html, 2000)
+        return { url, text }
+      })
+    )
 
-  const validSubs = subResults.filter(r => r.text.length > 200).slice(0, 3)
-  const combined = [homepage, ...validSubs.map(r => r.text)].join('\n\n---\n\n')
-  const sources = [baseUrl, ...validSubs.map(r => r.url)]
-  return { content: combined.slice(0, 10000), sources }
+    const validSubs = subResults.filter(r => r.text.length > 200).slice(0, 3)
+    const combined = [homepage, ...validSubs.map(r => r.text)].join('\n\n---\n\n')
+    const sources = [baseUrl, ...validSubs.map(r => r.url)]
+    return { content: combined.slice(0, 10000), sources }
+  } catch {
+    return { content: '', sources: [baseUrl] }
+  }
 }
 
 async function fetchDDGInstantAnswer(domain: string): Promise<string> {
