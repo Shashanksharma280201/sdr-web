@@ -22,7 +22,8 @@ async function fetchText(url: string): Promise<string> {
 }
 
 function stripHtml(html: string, cap = 4000): string {
-  return html
+  const raw = html.slice(0, 200_000)
+  return raw
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<[^>]+>/g, ' ')
@@ -37,6 +38,7 @@ async function fetchSitePages(baseUrl: string): Promise<{ content: string; sourc
   try {
     const homepageHtml = await fetchText(baseUrl)
     const homepage = stripHtml(homepageHtml, 3000)
+    if (!homepage) return { content: '', sources: [] }
 
     const subResults = await Promise.all(
       SUB_PAGES.map(async (path) => {
@@ -52,7 +54,7 @@ async function fetchSitePages(baseUrl: string): Promise<{ content: string; sourc
     const sources = [baseUrl, ...validSubs.map(r => r.url)]
     return { content: combined.slice(0, 10000), sources }
   } catch {
-    return { content: '', sources: [baseUrl] }
+    return { content: '', sources: [] }
   }
 }
 
@@ -85,20 +87,24 @@ async function searchDDG(query: string, cap = 2000): Promise<string> {
     const q = encodeURIComponent(query)
     const html = await fetchText(`https://html.duckduckgo.com/html/?q=${q}`)
     if (!html) return ''
-    const snippets: string[] = []
-    const snippetRe = /<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g
+    const items: string[] = []
     const titleRe   = /<a class="result__a"[^>]*>([\s\S]*?)<\/a>/g
+    const snippetRe = /<(?:span|a) class="result__snippet"[^>]*>([\s\S]*?)<\/(?:span|a)>/g
     let m: RegExpExecArray | null
-    const titles: string[] = []
-    while ((m = titleRe.exec(html)) !== null) titles.push(stripHtml(m[1], 120))
-    while ((m = snippetRe.exec(html)) !== null) snippets.push(stripHtml(m[1], 300))
-    const results = titles.slice(0, 5).map((t, i) => `${t}: ${snippets[i] ?? ''}`)
-    return results.join('\n').slice(0, cap)
+    while ((m = titleRe.exec(html)) !== null) {
+      const t = stripHtml(m[1], 150)
+      if (t) items.push(t)
+    }
+    while ((m = snippetRe.exec(html)) !== null) {
+      const s = stripHtml(m[1], 300)
+      if (s) items.push(s)
+    }
+    return items.slice(0, 10).join('\n').slice(0, cap)
   } catch { return '' }
 }
 
 async function scrapeCrunchbase(domain: string): Promise<string> {
-  const slug = domain.split('.')[0]
+  const slug = domain.replace(/^www\./, '').split('.')[0]
   try {
     const html = await fetchText(`https://www.crunchbase.com/organization/${slug}`)
     if (!html || html.length < 500) return ''
@@ -108,7 +114,7 @@ async function scrapeCrunchbase(domain: string): Promise<string> {
 }
 
 export async function researchCompany(url: string, domain: string): Promise<ResearchPacket> {
-  const companyName = domain.split('.')[0]
+  const companyName = domain.replace(/^www\./, '').split('.')[0]
 
   const [siteResult, instantAnswer, crunchbase, competitorSearch, newsSearch] = await Promise.all([
     fetchSitePages(url),
