@@ -116,15 +116,16 @@ async function scrapeCrunchbase(domain: string): Promise<string> {
 export async function researchCompany(url: string, domain: string): Promise<ResearchPacket> {
   const companyName = domain.replace(/^www\./, '').split('.')[0]
 
-  const [siteResult, instantAnswer, crunchbase, competitorSearch, newsSearch] = await Promise.all([
+  const [siteResult, instantAnswer, crunchbase, competitorSearch, newsSearch, startupSearch] = await Promise.all([
     fetchSitePages(url),
     fetchDDGInstantAnswer(domain),
     scrapeCrunchbase(domain),
     searchDDG(`${companyName} competitors alternatives vs`),
     searchDDG(`${companyName} ${domain} funding news 2024 2025`),
+    searchDDG(`"${companyName}" (crunchbase OR linkedin OR techcrunch OR yourstory OR economictimes OR tracxn)`),
   ])
 
-  const enrichmentParts = [instantAnswer, crunchbase].filter(Boolean)
+  const enrichmentParts = [instantAnswer, crunchbase, startupSearch].filter(Boolean)
 
   return {
     siteContent:       siteResult.content,
