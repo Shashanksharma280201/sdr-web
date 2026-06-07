@@ -236,6 +236,7 @@ export default function StrategyPage() {
   const [input,        setInput]        = useState('')
   const [streaming,    setStreaming]     = useState(false)
   const [streamBuffer, setStreamBuffer] = useState('')
+  const [researchingDomain, setResearchingDomain] = useState<string | null>(null)
   const [draftPreviews, setDraftPreviews] = useState<Record<string, Record<string, unknown>>>({})
 
   // Pipeline progress
@@ -532,7 +533,11 @@ export default function StrategyPage() {
           if (d.startsWith('{')) {
             try {
               const parsed = JSON.parse(d)
+              if (parsed.event === 'researching' && parsed.domain) {
+                setResearchingDomain(parsed.domain as string)
+              }
               if (parsed.token !== undefined) {
+                setResearchingDomain(null)
                 acc += parsed.token
                 setStreamBuffer(acc)
                 const preview = extractJsonBlock(acc)
@@ -574,6 +579,7 @@ export default function StrategyPage() {
       setStreamBuffer('')
     } finally {
       setStreaming(false)
+      setResearchingDomain(null)
       textareaRef.current?.focus()
     }
   }, [input, streaming, activeSessionId])
@@ -800,8 +806,12 @@ export default function StrategyPage() {
             {/* Typing indicator */}
             {streaming && !streamBuffer && (
               <div style={{ padding: '6px 32px', display: 'flex', justifyContent: 'flex-start' }}>
-                <div style={{ padding: '10px 16px', borderRadius: '12px 12px 12px 3px', background: D.surface2, border: `1px solid ${D.border}`, display: 'flex', gap: '4px', alignItems: 'center' }}>
-                  {[0,1,2].map(i => <div key={i} style={{ width: '6px', height: '6px', borderRadius: '50%', background: D.textMuted, animation: `sp-blink 1.4s ease-in-out ${i*0.2}s infinite` }} />)}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', borderRadius: '10px', background: D.surface, border: `1px solid ${D.border}`, fontSize: '13px', color: D.text2 }}>
+                  <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: D.accent }} />
+                  {researchingDomain
+                    ? `Researching ${researchingDomain}…`
+                    : 'Thinking…'
+                  }
                 </div>
               </div>
             )}
