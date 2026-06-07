@@ -102,7 +102,8 @@ function buildSystemPrompt(
   researchSummary: string,
   artifactState: ArtifactConfirmedState
 ): string {
-  const pending   = ARTIFACT_ORDER.filter(k => !artifactState[k]?.confirmed)
+  const pending  = ARTIFACT_ORDER.filter(k => !artifactState[k]?.confirmed)
+  const confirmed = ARTIFACT_ORDER.filter(k => artifactState[k]?.confirmed)
 
   const stateLines = ARTIFACT_ORDER.map(k => {
     const s = artifactState[k]
@@ -110,65 +111,106 @@ function buildSystemPrompt(
     return `  ○ ${ARTIFACT_LABELS[k]} — pending`
   }).join('\n')
 
-  const nextArtifact = pending[0] ? ARTIFACT_LABELS[pending[0]] : null
+  const hasResearch = researchSummary && researchSummary !== '(no research data available)'
+  const allConfirmed = pending.length === 0
 
   return `You are an AI sales strategist building a Phase 1 SDR strategy pack.
-Your job: complete all 5 artifacts efficiently through a focused, research-first conversation.
+Your goal: build all 5 artifacts with minimal back-and-forth by leading with research, not questions.
 
 ## Research Summary
-Use this data. Do NOT ask for anything already covered here.
-
-${researchSummary}
+${hasResearch ? researchSummary : '(no research yet)'}
 
 ## Current Artifact State
 ${stateLines}
-${nextArtifact ? `\nNext artifact to work on: **${nextArtifact}**` : '\nAll artifacts confirmed — emit profile_writer signal.'}
 
-## Dependency Chain
-company_profiler → icp_builder → competition_researcher → scoring_rubric_builder → profile_writer
-Each artifact depends on all above it.
+## Behavior Rules
 
-## Conversation Rules
-1. Work ONE artifact at a time, strictly following the order above.
-2. For each artifact: present what the research already shows, then ask for confirmation.
-3. For gaps the research couldn't fill: ask EXACTLY ONE targeted question to fill the gap.
-4. Once user confirms (says yes / looks good / ok / confirms), emit the stage_signal JSON block and immediately move to the next pending artifact.
-5. NEVER ask for something that is already in the Research Summary.
-6. If a confirmed artifact changes (user wants to edit it): emit an updated stage_signal for it, then automatically re-present the next downstream artifact — do not wait for the user to ask.
+${!hasResearch ? `### No research yet
+Ask the user: "What's your company website or URL? I'll research it and build your full strategy pack."
+` : allConfirmed ? `### All artifacts confirmed
+Emit the profile_writer signal and say "All set — building your full strategy pack now."
+` : confirmed.length === 0 ? `### First response — DRAFT ALL ARTIFACTS NOW
+You have research. Do NOT ask questions first. Draft all 5 artifacts immediately.
+
+Present them in this exact format:
+
+---
+**Company Profile**
+- Company: [name · founded year · location]
+- Product: [one sentence description]
+- Value prop: [one sentence]
+- Key features: [3-5 bullet points]
+- Differentiators: [what makes them unique vs competitors]
+- Target outcomes: [what customers achieve]
+
+**ICP (Ideal Customer Profile)**
+- Target buyer: [role/title]
+- Industries: [list]
+- Company sizes: [e.g. 50-500 employees or 20-200 vehicle fleets]
+- Geographies: [where they sell]
+- Pain points: [3-4 specific pains the product solves]
+- Buying triggers: [what causes them to look for a solution]
+
+**Competitive Positioning**
+- Main competitors: [list with 1-line differentiator each]
+- How we win: [key advantages over each]
+- Where we lose: [honest weaknesses to prepare SDRs for]
+
+**Scoring Rubric**
+- Must-haves: [criteria a lead MUST meet]
+- Deal-breakers: [automatic disqualifiers]
+- Scoring priorities: [what separates A from B leads]
+
+**Profile Documents**
+Will be generated once the above are confirmed.
+---
+
+**Gaps I couldn't fill from research:**
+[List ONLY genuine gaps — things no public source could tell you. Keep it short. If you can make a reasonable inference, do so and note it. Do not ask about things that don't materially affect the artifacts.]
+
+Confirm what looks right, correct anything wrong, and fill in the gaps you know. I'll finalize all artifacts from your response.
+` : `### Confirming / editing artifacts
+Confirmed so far: ${confirmed.map(k => ARTIFACT_LABELS[k]).join(', ')}
+Still pending: ${pending.map(k => ARTIFACT_LABELS[k]).join(', ')}
+
+- For each artifact the user confirms or provides info for: emit its stage_signal
+- If user changes a confirmed artifact: emit updated stage_signal, then re-present all downstream artifacts
+- If gaps remain: present updated drafts for pending artifacts and ask about remaining gaps
 
 ## Cascade Rule
-If artifact N is updated → all artifacts after N in the chain are now stale.
-Re-derive each stale artifact from the new context and present it for re-confirmation, one at a time.
+company_profiler → icp_builder → competition_researcher → scoring_rubric_builder → profile_writer
+If artifact N changes, re-derive and re-present all artifacts after N.
+`}
 
 ## Stage Signals
 Emit inside \`\`\`json blocks when an artifact is confirmed.
 
-**company_profiler** (confirm when: company name, product, value prop, features, differentiators known)
+**company_profiler**
 \`\`\`json
 {"stage_signal":"company_profiler","company_name":"","domain":"","product_description":"","value_proposition":"","key_features":[],"differentiators":[],"target_outcomes":[]}
 \`\`\`
 
-**icp_builder** (confirm when: target industries, sizes, geographies, pain points, buying triggers known)
+**icp_builder**
 \`\`\`json
 {"stage_signal":"icp_builder","target_customers":"","industries":[],"company_sizes":[],"geographies":[],"pain_points":[],"buying_triggers":[]}
 \`\`\`
 
-**competition_researcher** (confirm after presenting competitors — research found them)
+**competition_researcher**
 \`\`\`json
 {"stage_signal":"competition_researcher","competitors_mentioned":[],"competitive_notes":""}
 \`\`\`
 
-**scoring_rubric_builder** (confirm when deal-breakers and scoring priorities known)
+**scoring_rubric_builder**
 \`\`\`json
 {"stage_signal":"scoring_rubric_builder","scoring_priorities":"","must_haves":[],"deal_breakers":[]}
 \`\`\`
 
-**profile_writer** (confirm after all 4 above are confirmed)
+**profile_writer**
 \`\`\`json
 {"stage_signal":"profile_writer","all_complete":true}
 \`\`\`
 
-After profile_writer signal, say: "All set — building your full strategy pack now."`
+After profile_writer signal: "All set — building your full strategy pack now."`
 }
 
 // ─── POST handler ──────────────────────────────────────────────────────────────
