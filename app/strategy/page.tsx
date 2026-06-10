@@ -61,6 +61,14 @@ const STALE_CASCADES: Record<string, string[]> = {
   scoring_rubric:          ['profile_writer'],
 }
 
+// Stage → artifact entry_name (for preview tabs)
+const STAGE_TO_ENTRY: Record<string, string> = {
+  company_profiler:       'company_raw',
+  icp_builder:            'icp_data',
+  competition_researcher: 'competitive_positioning',
+  scoring_rubric_builder: 'scoring_rubric',
+}
+
 // Artifact entry_name → stage id
 const ARTIFACT_TO_STAGE: Record<string, string> = {
   company_raw:             'company_profiler',
@@ -196,6 +204,58 @@ function ProfileDocsView({ data }: { data: any }) {
     </div>}
   </div>
 }
+function IcpPreviewView({ data }: { data: Record<string, unknown> }) {
+  const industries = (data.industries as string[]) || []
+  const companySizes = (data.company_sizes as string[]) || []
+  const geographies = (data.geographies as string[]) || []
+  const painPoints = (data.pain_points as string[]) || []
+  const buyingTriggers = (data.buying_triggers as string[]) || []
+  return <div>
+    {!!data.target_customers && <><SectionLabel label="Target Buyers" /><div style={{ fontSize: '12.5px', color: D.text, lineHeight: 1.6, marginBottom: '10px' }}>{String(data.target_customers)}</div></>}
+    {industries.length > 0 && <><SectionLabel label="Industries" /><div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', marginBottom: '10px' }}>{industries.map(v => <Chip key={v} text={v} color={D.info} />)}</div></>}
+    {companySizes.length > 0 && <><SectionLabel label="Company Sizes" /><div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', marginBottom: '10px' }}>{companySizes.map(v => <Chip key={v} text={v} color={D.success} />)}</div></>}
+    {geographies.length > 0 && <><SectionLabel label="Geographies" /><div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', marginBottom: '10px' }}>{geographies.map(v => <Chip key={v} text={v} color={D.accent} />)}</div></>}
+    {painPoints.length > 0 && <><SectionLabel label="Pain Points" /><Bullet items={painPoints} color={D.warn} /></>}
+    {buyingTriggers.length > 0 && <><SectionLabel label="Buying Triggers" /><Bullet items={buyingTriggers} color={D.accent} /></>}
+  </div>
+}
+
+function CompetitorPreviewView({ data }: { data: Record<string, unknown> }) {
+  const competitors = (data.competitors_mentioned as string[]) || []
+  return <div>
+    {competitors.length > 0 && (<>
+      <SectionLabel label="Competitors Found" />
+      {competitors.map((c, i) => (
+        <div key={i} style={{ padding: '6px 10px', background: D.surface2, borderRadius: '5px', marginBottom: '4px', fontSize: '12.5px', color: D.text, border: `1px solid ${D.border}` }}>
+          {typeof c === 'string' ? c : String(c)}
+        </div>
+      ))}
+    </>)}
+    {!!data.competitive_notes && (<>
+      <SectionLabel label="Notes" />
+      <div style={{ fontSize: '12.5px', color: D.text, lineHeight: 1.6 }}>{String(data.competitive_notes)}</div>
+    </>)}
+  </div>
+}
+
+function ScoringPreviewView({ data }: { data: Record<string, unknown> }) {
+  const mustHaves = (data.must_haves as string[]) || []
+  const dealBreakers = (data.deal_breakers as string[]) || []
+  return <div>
+    {!!data.scoring_priorities && (<><SectionLabel label="Scoring Priorities" /><div style={{ fontSize: '12.5px', color: D.text, lineHeight: 1.6, marginBottom: '10px', padding: '10px 12px', background: D.surface2, borderRadius: '6px', border: `1px solid ${D.border}` }}>{String(data.scoring_priorities)}</div></>)}
+    {mustHaves.length > 0 && <><SectionLabel label="Must-Haves" /><Bullet items={mustHaves} color={D.success} /></>}
+    {dealBreakers.length > 0 && <><SectionLabel label="Deal-Breakers" /><Bullet items={dealBreakers} color={D.bad} /></>}
+  </div>
+}
+
+function SignalPreviewView({ stage, data }: { stage: string; data: Record<string, unknown> }) {
+  if (stage === 'company_profiler')       return <CompanyRawView data={data} />
+  if (stage === 'icp_builder')            return <IcpPreviewView data={data} />
+  if (stage === 'competition_researcher') return <CompetitorPreviewView data={data} />
+  if (stage === 'scoring_rubric_builder') return <ScoringPreviewView data={data} />
+  return <pre style={{ fontSize: '11px', color: D.text2, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{JSON.stringify(data, null, 2)}</pre>
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function ArtifactView({ entryName, data }: { entryName: string; data: any }) {
   if (entryName === 'icp_data')                return <ICPView data={data} />
@@ -238,6 +298,9 @@ export default function StrategyPage() {
   const [streamBuffer, setStreamBuffer] = useState('')
   const [researchingDomain, setResearchingDomain] = useState<string | null>(null)
   const [draftPreviews, setDraftPreviews] = useState<Record<string, Record<string, unknown>>>({})
+  const [artifactPreviews, setArtifactPreviews] = useState<Record<string, Record<string, unknown>>>({})
+  const [researchSteps, setResearchSteps] = useState<string[]>([])
+  const [researchComplete, setResearchComplete] = useState(false)
 
   // Pipeline progress
   const [pipelineTaskId,   setPipelineTaskId]   = useState<string | null>(null)
@@ -510,6 +573,9 @@ export default function StrategyPage() {
     setStreaming(true)
     setStreamBuffer('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    setArtifactPreviews({})
+    setResearchSteps([])
+    setResearchComplete(false)
 
     try {
       const res = await fetch('/api/strategy/chat/stream', {
@@ -535,6 +601,21 @@ export default function StrategyPage() {
               const parsed = JSON.parse(d)
               if (parsed.event === 'researching' && parsed.domain) {
                 setResearchingDomain(parsed.domain as string)
+              }
+              if (parsed.event === 'research_start') {
+                setResearchingDomain(parsed.domain as string)
+                setResearchSteps((parsed.steps as string[]) || [])
+                setResearchComplete(false)
+              }
+              if (parsed.event === 'research_complete') {
+                setResearchComplete(true)
+              }
+              if (parsed.artifact_ready && parsed.stage && parsed.data) {
+                const stage = parsed.stage as string
+                const data = parsed.data as Record<string, unknown>
+                setArtifactPreviews(prev => ({ ...prev, [stage]: data }))
+                // Auto-select first preview in right panel
+                setActiveArtifact(prev => prev ?? `preview:${stage}`)
               }
               if (parsed.token !== undefined) {
                 setResearchingDomain(null)
@@ -580,6 +661,7 @@ export default function StrategyPage() {
     } finally {
       setStreaming(false)
       setResearchingDomain(null)
+      setResearchComplete(false)
       textareaRef.current?.focus()
     }
   }, [input, streaming, activeSessionId])
@@ -594,17 +676,19 @@ export default function StrategyPage() {
   const phaseMap        = new Map(phases.map(p => [p.name, p]))
 
   const getStageStatus = (stageId: string): 'done' | 'active' | 'stale' | 'idle' => {
-    if (runningStages.has(stageId)) return 'active'
     if (staleStages.has(stageId)) return 'stale'
-    // Artifact presence is the most reliable completion signal
     const stg = STAGES.find(s => s.id === stageId)
     if (stg && artifacts.find(a => a.entry_name === stg.artifactKey)) return 'done'
+    if (artifactPreviews[stageId]) return 'done'
+    if (runningStages.has(stageId)) return 'active'
     const p = phaseMap.get(stageId)
     if (!p) return 'idle'
     if (p.status === 'completed') return 'done'
     if (['open', 'running', 'active', 'in_progress'].includes(p.status)) return 'active'
     return 'idle'
   }
+
+  const allPhase1Done = STAGE_PHASE_KEYS.every(id => getStageStatus(id) === 'done')
 
   const draftPreview = activeSessionId ? (draftPreviews[activeSessionId] ?? null) : null
   const activeArtifactMeta    = artifacts.find(a => a.id === activeArtifact)
@@ -656,7 +740,7 @@ export default function StrategyPage() {
 
             {/* Stage progress */}
             <div style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase', color: D.textMuted, marginBottom: '8px', padding: '0 4px' }}>Pipeline Stages</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginBottom: '18px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginBottom: allPhase1Done ? '8px' : '18px' }}>
               {STAGES.map((s, idx) => {
                 const st = getStageStatus(s.id)
                 const isStale   = st === 'stale'
@@ -709,6 +793,13 @@ export default function StrategyPage() {
               })}
             </div>
 
+            {allPhase1Done && (
+              <div style={{ padding: '6px 8px', marginBottom: '16px', borderRadius: '6px', background: D.successSoft, border: `1px solid ${D.success}44`, display: 'flex', alignItems: 'center', gap: '7px' }}>
+                <CheckCircle size={12} color={D.success} />
+                <span style={{ fontSize: '11px', fontWeight: 600, color: D.success }}>Phase 1 complete</span>
+              </div>
+            )}
+
             {/* Sessions history */}
             {sessions.length > 0 && <>
               <div style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase', color: D.textMuted, marginBottom: '8px', padding: '0 4px' }}>Conversations</div>
@@ -734,6 +825,20 @@ export default function StrategyPage() {
 
         {/* ── MIDDLE: CHAT ───────────────────────────────────────────────── */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
+
+          {/* Phase 1 complete banner */}
+          {allPhase1Done && !pipelineRunning && (
+            <div style={{ padding: '10px 24px', background: D.successSoft, borderBottom: `1px solid ${D.success}44`, display: 'flex', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
+              <CheckCircle size={15} color={D.success} />
+              <div style={{ flex: 1 }}>
+                <span style={{ fontSize: '13px', fontWeight: 600, color: D.success }}>Phase 1 complete</span>
+                <span style={{ fontSize: '12px', color: D.text2, marginLeft: '10px' }}>All 5 strategy artifacts are ready — Company Profile, ICP, Competitive Positioning, Scoring Rubric, Profile Documents.</span>
+              </div>
+              <button className="sp-btn" style={{ padding: '6px 14px', background: D.success, color: '#fff', border: 'none', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+                <Zap size={12} />Start Sales Pipeline
+              </button>
+            </div>
+          )}
 
           {/* Pipeline banner */}
           {pipelineRunning && <div style={{ padding: '8px 24px', background: D.accentSoft, borderBottom: `1px solid ${D.accent}44`, display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
@@ -779,6 +884,9 @@ export default function StrategyPage() {
                   </div>
                 )
                 const isUser = msg.role === 'user'
+                const displayContent = msg.role === 'assistant'
+                  ? msg.content.replace(/```json[\s\S]*?```/g, '').trim()
+                  : msg.content
                 return <div key={msg.id} style={{ padding: '6px 32px', display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
                   <div style={{
                     maxWidth: '72%', padding: '10px 14px',
@@ -788,7 +896,7 @@ export default function StrategyPage() {
                     fontSize: '13.5px', lineHeight: 1.65,
                     border: isUser ? 'none' : `1px solid ${D.border}`,
                   }}>
-                    {msg.content.split('\n').map((line, i, arr) => <span key={i}>{line}{i < arr.length - 1 && <br />}</span>)}
+                    {displayContent.split('\n').map((line, i, arr) => <span key={i}>{line}{i < arr.length - 1 && <br />}</span>)}
                   </div>
                 </div>
               })
@@ -806,12 +914,27 @@ export default function StrategyPage() {
             {/* Typing indicator */}
             {streaming && !streamBuffer && (
               <div style={{ padding: '6px 32px', display: 'flex', justifyContent: 'flex-start' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', borderRadius: '10px', background: D.surface, border: `1px solid ${D.border}`, fontSize: '13px', color: D.text2 }}>
-                  <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: D.accent }} />
-                  {researchingDomain
-                    ? `Researching ${researchingDomain}…`
-                    : 'Thinking…'
-                  }
+                <div style={{ padding: '10px 14px', borderRadius: '10px', background: D.surface, border: `1px solid ${D.border}`, fontSize: '13px', color: D.text2 }}>
+                  {researchingDomain && !researchComplete ? (
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: researchSteps.length > 0 ? '8px' : 0 }}>
+                        <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: D.accent }} />
+                        <span>Researching {researchingDomain}…</span>
+                      </div>
+                      {researchSteps.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingLeft: '22px' }}>
+                          {researchSteps.map((step, i) => (
+                            <div key={i} style={{ fontSize: '11.5px', color: D.textMuted }}>· {step}</div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: D.accent }} />
+                      {researchComplete ? `Research complete — building artifacts…` : 'Thinking…'}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -848,7 +971,7 @@ export default function StrategyPage() {
         <div style={{ width: 360, minWidth: 360, borderLeft: `1px solid ${D.border}`, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: D.surface }}>
           <div style={{ padding: '10px 12px 0', borderBottom: `1px solid ${D.border}`, flexShrink: 0 }}>
             <div style={{ fontSize: '10px', fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase', color: D.textMuted, marginBottom: '8px' }}>Artifacts</div>
-            {artifacts.length > 0 ? (
+            {(artifacts.length > 0 || Object.keys(artifactPreviews).length > 0) ? (
               <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', paddingBottom: '8px', alignItems: 'center' }}>
                 {artifacts.map(a => {
                   const meta = ARTIFACT_META[a.entry_name]
@@ -858,6 +981,23 @@ export default function StrategyPage() {
                     style={{ padding: '3px 9px', fontSize: '11px', fontWeight: isActive ? 600 : 400, color: isActive ? meta.color : D.text2, background: isActive ? `${meta.color}18` : 'transparent', border: `1px solid ${isActive ? meta.color + '55' : D.border}`, borderRadius: '5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px' }}>
                     {meta.icon}{meta.label}
                   </button>
+                })}
+                {/* Preview tabs — stage signal data before real artifacts load */}
+                {Object.keys(artifactPreviews).map(stage => {
+                  const entryName = STAGE_TO_ENTRY[stage]
+                  if (!entryName) return null
+                  const meta = ARTIFACT_META[entryName]
+                  if (!meta) return null
+                  if (artifacts.find(a => a.entry_name === entryName)) return null  // real artifact exists
+                  const isActive = activeArtifact === `preview:${stage}`
+                  return (
+                    <button key={`preview:${stage}`} className="sp-art-tab"
+                      onClick={() => setActiveArtifact(`preview:${stage}`)}
+                      style={{ padding: '3px 9px', fontSize: '11px', fontWeight: isActive ? 600 : 400, color: isActive ? meta.color : D.text2, background: isActive ? `${meta.color}18` : 'transparent', border: `1px solid ${isActive ? meta.color + '55' : D.border}`, borderRadius: '5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                      {meta.icon}{meta.label}
+                      <span style={{ fontSize: '9px', padding: '1px 4px', background: `${D.textMuted}22`, color: D.textMuted, borderRadius: '3px' }}>draft</span>
+                    </button>
+                  )
                 })}
                 {/* Re-run button */}
                 {activeSessionId && sessions.find(s => s.id === activeSessionId)?.context_text && (
@@ -877,6 +1017,27 @@ export default function StrategyPage() {
           </div>
 
           <div style={{ flex: 1, overflowY: 'auto', padding: '16px 14px' }}>
+            {/* Phase 1 complete card */}
+            {allPhase1Done && (
+              <div style={{ marginBottom: '16px', padding: '16px', background: D.successSoft, borderRadius: '10px', border: `1px solid ${D.success}44` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                  <CheckCircle size={16} color={D.success} />
+                  <span style={{ fontSize: '13px', fontWeight: 700, color: D.success }}>Phase 1 Complete</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {STAGES.map(s => (
+                    <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: D.text }}>
+                      <CheckCircle size={11} color={D.success} />
+                      {s.label}
+                    </div>
+                  ))}
+                </div>
+                <button className="sp-btn" style={{ marginTop: '14px', width: '100%', padding: '8px', background: D.success, color: '#fff', border: 'none', borderRadius: '7px', fontSize: '12.5px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                  <Zap size={13} />Start Sales Pipeline
+                </button>
+              </div>
+            )}
+
             {/* Draft preview */}
             {!activeArtifactContent && draftPreview && (
               <div style={{ marginBottom: '16px', padding: '12px', background: D.surface2, borderRadius: '8px', border: `1px dashed ${D.border2}` }}>
@@ -884,6 +1045,31 @@ export default function StrategyPage() {
                 <ArtifactView entryName={Object.keys(draftPreview)[0] ?? ''} data={draftPreview} />
               </div>
             )}
+
+            {/* Stage signal preview — artifact data confirmed by AI, pipeline building */}
+            {!activeArtifactContent && activeArtifact?.startsWith('preview:') && (() => {
+              const previewStage = activeArtifact.replace('preview:', '')
+              const previewData = artifactPreviews[previewStage]
+              const entryName = STAGE_TO_ENTRY[previewStage]
+              const meta = entryName ? ARTIFACT_META[entryName] : null
+              if (!previewData || !meta) return null
+              return (
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
+                    <span style={{ color: meta.color }}>{meta.icon}</span>
+                    <span style={{ fontSize: '13px', fontWeight: 600, color: D.text }}>{meta.label}</span>
+                    <span style={{ fontSize: '10px', padding: '2px 7px', borderRadius: '4px', background: `${D.accent}18`, color: D.accent, border: `1px solid ${D.accent}44` }}>AI Draft</span>
+                    {runningStages.has(previewStage) && (
+                      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', color: D.accent }}>
+                        <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} />
+                        Building…
+                      </div>
+                    )}
+                  </div>
+                  <SignalPreviewView stage={previewStage} data={previewData} />
+                </div>
+              )
+            })()}
 
             {activeArtifactContent && activeArtifactMeta ? (
               <>

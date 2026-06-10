@@ -331,7 +331,17 @@ const PROFILE_BUILDER_STAGES = [
   { key: 'profile_writer',         label: 'Profile Writer',         desc: 'Synthesise final ICP, Persona, and Company Profile' },
 ]
 
+const PROFILE_BUILDER_WEB_STAGES = [
+  { key: 'intake_conversation',    label: 'Intake Conversation',    desc: 'Clay research + guided chat to gather context' },
+  { key: 'company_profiler',       label: 'Company Profiler',       desc: 'Build structured company profile from context' },
+  { key: 'icp_builder',            label: 'ICP Builder',            desc: 'Define ideal customer profile' },
+  { key: 'competition_researcher', label: 'Competition Researcher', desc: 'Map competitive landscape using Clay' },
+  { key: 'scoring_rubric_builder', label: 'Scoring Rubric Builder', desc: 'Build lead scoring framework' },
+  { key: 'profile_writer',         label: 'Profile Writer',         desc: 'Synthesise final ICP, Persona, and Company Profile' },
+]
+
 function stagesForTask(taskName: string) {
+  if (taskName === 'sdr:core:profile-builder-web') return PROFILE_BUILDER_WEB_STAGES
   if (taskName === 'sdr:core:profile-builder') return PROFILE_BUILDER_STAGES
   return SALES_STAGES
 }
@@ -340,6 +350,10 @@ function stageSummary(key: string, phase?: Phase): string | null {
   if (!phase || phase.status !== 'completed' || !phase.stage_result) return null
   const r = phase.stage_result as Record<string, unknown>
   switch (key) {
+    case 'intake_conversation': {
+      const company = (r?.context_gathered as Record<string, string>)?.company_name
+      return company ? `${company} — context gathered` : '✓ Intake complete'
+    }
     case 'company_profiler': {
       const name = (r?.company_raw as Record<string, string>)?.company_name || (r as Record<string, string>)?.company_name
       return name ? `${name}` : '✓ Company profile extracted'
@@ -602,19 +616,30 @@ function LiveMonitor({ activeTasks, onPhaseSelect }: { activeTasks: Task[]; onPh
             }}>
               <div style={{ fontSize: '12.5px', color: 'var(--ink-3)', flex: 1 }}>
                 <span style={{ fontWeight: 600, color: 'var(--ink)' }}>What&apos;s next?</span>
-                {activeTask.name === 'sdr:core:profile-builder'
+                {(activeTask.name === 'sdr:core:profile-builder' || activeTask.name === 'sdr:core:profile-builder-web')
                   ? ' Your ICP and scoring rubric are ready. Go run prospecting to find leads.'
                   : ' Your leads, enrichment and email drafts are ready to review.'}
               </div>
-              {activeTask.name === 'sdr:core:profile-builder' ? (
-                <a href="/pipeline" style={{
-                  display: 'inline-flex', alignItems: 'center', gap: '6px',
-                  padding: '7px 14px', fontSize: '12.5px', fontWeight: 600,
-                  background: 'var(--accent)', color: 'white',
-                  borderRadius: '6px', textDecoration: 'none', whiteSpace: 'nowrap',
-                }}>
-                  Run Prospecting →
-                </a>
+              {(activeTask.name === 'sdr:core:profile-builder' || activeTask.name === 'sdr:core:profile-builder-web') ? (
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <a href="/pipeline" style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '6px',
+                    padding: '7px 14px', fontSize: '12.5px', fontWeight: 600,
+                    background: 'var(--accent)', color: 'white',
+                    borderRadius: '6px', textDecoration: 'none', whiteSpace: 'nowrap',
+                  }}>
+                    Run Prospecting →
+                  </a>
+                  <a href="/strategy" style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '6px',
+                    padding: '7px 14px', fontSize: '12.5px', fontWeight: 500,
+                    background: 'var(--paper)', color: 'var(--ink-2)',
+                    border: '1px solid var(--line)',
+                    borderRadius: '6px', textDecoration: 'none', whiteSpace: 'nowrap',
+                  }}>
+                    View Strategy →
+                  </a>
+                </div>
               ) : (
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <a href="/prospect" style={{

@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { spawn } from 'child_process'
 import sql from '@/lib/db'
 import { ensureSchema } from '../../sessions/route'
-import { researchCompany, formatResearchForPrompt, type ResearchPacket } from '@/lib/research'
+import { researchCompany, formatResearchForPrompt } from '@/lib/research'
 
 type ArtifactConfirmedState = {
   company_profiler?:       { confirmed: boolean; data: Record<string, unknown> | null }
@@ -128,7 +128,13 @@ ${stateLines}
 ${!hasResearch ? `### No research yet
 Ask the user: "What's your company website or URL? I'll research it and build your full strategy pack."
 ` : allConfirmed ? `### All artifacts confirmed
-Emit the profile_writer signal and say "All set — building your full strategy pack now."
+Emit the profile_writer signal. Then say:
+
+"**Phase 1 is complete.** All 5 strategy artifacts are confirmed and your profile pack is being built in the background.
+
+You're ready to move to Phase 2: **Sales Pipeline** — that's where we build your lead list, personalize outreach, and set up the full SDR sequence based on everything we just defined.
+
+Want to start the Sales Pipeline now?"
 ` : confirmed.length === 0 ? `### First response — DRAFT ALL ARTIFACTS NOW
 You have research. Do NOT ask questions first. Draft all 5 artifacts immediately.
 
@@ -173,7 +179,7 @@ Confirm what looks right, correct anything wrong, and fill in the gaps you know.
 Confirmed so far: ${confirmed.map(k => ARTIFACT_LABELS[k]).join(', ')}
 Still pending: ${pending.map(k => ARTIFACT_LABELS[k]).join(', ')}
 
-- For each artifact the user confirms or provides info for: emit its stage_signal
+- For each artifact the user confirms or provides info for: emit its stage_signal inline, immediately after presenting/confirming that artifact
 - If user changes a confirmed artifact: emit updated stage_signal, then re-present all downstream artifacts
 - If gaps remain: present updated drafts for pending artifacts and ask about remaining gaps
 
@@ -182,35 +188,45 @@ company_profiler → icp_builder → competition_researcher → scoring_rubric_b
 If artifact N changes, re-derive and re-present all artifacts after N.
 `}
 
-## Stage Signals
-Emit inside \`\`\`json blocks when an artifact is confirmed.
+## Stage Signals — EMIT AFTER EACH SECTION
 
-**company_profiler**
+CRITICAL: Emit each stage_signal IMMEDIATELY after presenting that artifact section.
+Do NOT collect all signals at the end. The order must be:
+
+**Company Profile**
+[all company profile content here]
 \`\`\`json
-{"stage_signal":"company_profiler","company_name":"","domain":"","product_description":"","value_proposition":"","key_features":[],"differentiators":[],"target_outcomes":[]}
+{"stage_signal":"company_profiler","company_name":"...","domain":"...","product_description":"...","value_proposition":"...","key_features":[...],"differentiators":[...],"target_outcomes":[...]}
 \`\`\`
 
-**icp_builder**
+**ICP (Ideal Customer Profile)**
+[all ICP content here]
 \`\`\`json
-{"stage_signal":"icp_builder","target_customers":"","industries":[],"company_sizes":[],"geographies":[],"pain_points":[],"buying_triggers":[]}
+{"stage_signal":"icp_builder","target_customers":"...","industries":[...],"company_sizes":[...],"geographies":[...],"pain_points":[...],"buying_triggers":[...]}
 \`\`\`
 
-**competition_researcher**
+**Competitive Positioning**
+[all competitive content here]
 \`\`\`json
-{"stage_signal":"competition_researcher","competitors_mentioned":[],"competitive_notes":""}
+{"stage_signal":"competition_researcher","competitors_mentioned":[...],"competitive_notes":"..."}
 \`\`\`
 
-**scoring_rubric_builder**
+**Scoring Rubric**
+[all scoring content here]
 \`\`\`json
-{"stage_signal":"scoring_rubric_builder","scoring_priorities":"","must_haves":[],"deal_breakers":[]}
+{"stage_signal":"scoring_rubric_builder","scoring_priorities":"...","must_haves":[...],"deal_breakers":[...]}
 \`\`\`
 
-**profile_writer**
+**Profile Documents**
+Will be generated once the above are confirmed.
 \`\`\`json
 {"stage_signal":"profile_writer","all_complete":true}
 \`\`\`
 
-After profile_writer signal: "All set — building your full strategy pack now."`
+**Gaps I couldn't fill from research:**
+[List ONLY genuine gaps — things no public source could tell you. Keep it short.]
+
+This is the ONLY valid format. Do not output all signals at the bottom.`
 }
 
 // ─── POST handler ──────────────────────────────────────────────────────────────
@@ -225,185 +241,200 @@ export async function POST(req: NextRequest) {
     return new Response('session_id and message required', { status: 400 })
   }
 
-  await ensureSchema()
-
-  // Persist user message first so it appears in the history load below
-  await sql`
-    INSERT INTO strategy_chats (session_id, agent_name, role, content)
-    VALUES (${session_id}, ${agent ?? 'profile_builder_web'}, 'user', ${message})
-  `
-
-  // Load history and artifact state in parallel
-  const [historyRows, sessionRows] = await Promise.all([
-    sql<{ role: string; content: string }[]>`
-      SELECT role, content FROM strategy_chats
-      WHERE session_id = ${session_id}
-      ORDER BY created_at ASC
-      LIMIT 60
-    `,
-    sql<{ artifact_state: ArtifactConfirmedState | null }[]>`
-      SELECT artifact_state FROM strategy_sessions WHERE id = ${session_id}
-    `,
-  ])
-
-  const history      = historyRows
-  const artifactState: ArtifactConfirmedState = (sessionRows[0]?.artifact_state as ArtifactConfirmedState) ?? {}
-
-  // Auto-title session from first user message
-  if (history.length <= 1) {
-    const title = message.length > 50 ? message.slice(0, 47) + '…' : message
-    await sql`UPDATE strategy_sessions SET title = ${title}, updated_at = NOW() WHERE id = ${session_id} AND title = 'New Analysis'`
-  } else {
-    await sql`UPDATE strategy_sessions SET updated_at = NOW() WHERE id = ${session_id}`
-  }
-
-  // Research the company from all messages so far
-  const allText = history.map(h => h.content).join(' ')
-  const url    = extractUrl(allText)
-  const domain = extractDomain(allText)
-
-  let researchSummary = ''
-  if (url && domain) {
-    const packet = await researchCompany(url, domain)
-    researchSummary = formatResearchForPrompt(packet, url)
-  } else if (url) {
-    try {
-      const html = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(6000) }).then(r => r.text()).catch(() => '')
-      researchSummary = html ? `Website content:\n${html.replace(/<[^>]+>/g, ' ').replace(/\s{3,}/g, '\n').trim().slice(0, 6000)}` : ''
-    } catch { researchSummary = '' }
-  }
-
-  // Build dynamic system prompt with research + current artifact state
-  const systemPrompt = buildSystemPrompt(researchSummary, artifactState)
-
-  const historyText = history.length > 1
-    ? '\n\nConversation so far:\n' + history.slice(0, -1).map(r => `${r.role === 'user' ? 'User' : 'Assistant'}: ${r.content}`).join('\n\n')
-    : ''
-
-  const fullPrompt = `${systemPrompt}${historyText}\n\nUser: ${message}\n\nAssistant:`
-
-  let fullContent = ''
-
+  // Start streaming immediately — all DB/research work happens inside the stream
   const stream = new ReadableStream({
-    start(controller) {
+    async start(controller) {
       const enc = new TextEncoder()
+      const send = (obj: unknown) =>
+        controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`))
 
-      if (domain) {
-        controller.enqueue(enc.encode(`data: ${JSON.stringify({ event: 'researching', domain })}\n\n`))
-      }
+      try {
+        await ensureSchema()
 
-      const proc = spawn(
-        '/home/shanks/.local/bin/claude',
-        ['-p', fullPrompt, '--output-format', 'text'],
-        { env: process.env }
-      )
+        // Persist user message first
+        await sql`
+          INSERT INTO strategy_chats (session_id, agent_name, role, content)
+          VALUES (${session_id}, ${agent ?? 'profile_builder_web'}, 'user', ${message})
+        `
 
-      proc.stdout.on('data', (chunk: Buffer) => {
-        const token = chunk.toString()
-        fullContent += token
-        controller.enqueue(enc.encode(`data: ${JSON.stringify({ token })}\n\n`))
-      })
+        // Load history + artifact state in parallel
+        const [historyRows, sessionRows] = await Promise.all([
+          sql<{ role: string; content: string }[]>`
+            SELECT role, content FROM strategy_chats
+            WHERE session_id = ${session_id}
+            ORDER BY created_at ASC
+            LIMIT 60
+          `,
+          sql<{ artifact_state: ArtifactConfirmedState | null }[]>`
+            SELECT artifact_state FROM strategy_sessions WHERE id = ${session_id}
+          `,
+        ])
 
-      proc.stderr.on('data', (chunk: Buffer) => {
-        console.error('[claude stream stderr]', chunk.toString().slice(0, 200))
-      })
+        const history = historyRows
+        const artifactState: ArtifactConfirmedState = (sessionRows[0]?.artifact_state as ArtifactConfirmedState) ?? {}
 
-      proc.on('close', async (code) => {
-        try {
-          if (fullContent.trim()) {
-            await sql`
-              INSERT INTO strategy_chats (session_id, agent_name, role, content)
-              VALUES (${session_id}, ${agent ?? 'profile_builder_web'}, 'assistant', ${fullContent})
-            `
-          }
+        // Auto-title session from first user message
+        if (history.length <= 1) {
+          const title = message.length > 50 ? message.slice(0, 47) + '…' : message
+          await sql`UPDATE strategy_sessions SET title = ${title}, updated_at = NOW() WHERE id = ${session_id} AND title = 'New Analysis'`
+        } else {
+          await sql`UPDATE strategy_sessions SET updated_at = NOW() WHERE id = ${session_id}`
+        }
 
-          // Detect per-stage signals — trigger each stage immediately as it's ready
-          const stageSignals: Array<{ stage: string; data: Record<string, unknown> }> = []
-          let accumulatedContext = ''
+        // Extract URL from all messages
+        const allText = history.map(h => h.content).join(' ')
+        const url    = extractUrl(allText)
+        const domain = extractDomain(allText)
 
+        // Research — emit step events before and after
+        let researchSummary = ''
+        if (url && domain) {
+          send({ event: 'research_start', domain, steps: ['Fetching company website', 'Searching news & competitors', 'Checking LinkedIn & databases'] })
+          const packet = await researchCompany(url, domain)
+          researchSummary = formatResearchForPrompt(packet, url)
+          send({ event: 'research_complete', sourceCount: packet.sources.length })
+        }
+
+        // Build system prompt
+        const systemPrompt = buildSystemPrompt(researchSummary, artifactState)
+
+        const historyText = history.length > 1
+          ? '\n\nConversation so far:\n' + history.slice(0, -1).map(r => `${r.role === 'user' ? 'User' : 'Assistant'}: ${r.content}`).join('\n\n')
+          : ''
+
+        const fullPrompt = `${systemPrompt}${historyText}\n\nUser: ${message}\n\nAssistant:`
+
+        let fullContent = ''
+        const processedBlockIndexes = new Set<number>()
+
+        const proc = spawn(
+          '/home/shanks/.local/bin/claude',
+          ['-p', fullPrompt, '--output-format', 'text'],
+          { env: process.env }
+        )
+
+        proc.stdout.on('data', (chunk: Buffer) => {
+          const token = chunk.toString()
+          fullContent += token
+          send({ token })
+
+          // Detect newly-completed JSON blocks mid-stream and emit artifact_ready events
           const jsonBlocks = [...fullContent.matchAll(/```json\s*([\s\S]*?)```/g)]
           for (const match of jsonBlocks) {
+            const idx = match.index ?? 0
+            if (processedBlockIndexes.has(idx)) continue
             try {
               const parsed = JSON.parse(match[1].trim()) as Record<string, unknown>
               if (typeof parsed.stage_signal === 'string') {
-                stageSignals.push({ stage: parsed.stage_signal, data: parsed })
-              }
-              // Legacy work_complete support
-              if (parsed.work_complete === true) {
-                stageSignals.push({ stage: 'company_profiler', data: parsed })
-                stageSignals.push({ stage: 'icp_builder', data: parsed })
-                stageSignals.push({ stage: 'competition_researcher', data: parsed })
-                stageSignals.push({ stage: 'scoring_rubric_builder', data: parsed })
-                stageSignals.push({ stage: 'profile_writer', data: parsed })
+                processedBlockIndexes.add(idx)
+                send({ artifact_ready: true, stage: parsed.stage_signal, data: parsed })
               }
             } catch {}
           }
+        })
 
-          // Build context text from company_profiler signal (or first signal)
-          const companySignal = stageSignals.find(s => s.stage === 'company_profiler')
-          if (companySignal) {
-            const d = companySignal.data
-            const parts: string[] = []
-            if (d.company_name)        parts.push(`Company: ${d.company_name}`)
-            if (d.domain)              parts.push(`Domain: ${d.domain}`)
-            if (d.product_description) parts.push(`Product: ${d.product_description}`)
-            if (d.value_proposition)   parts.push(`Value Proposition: ${d.value_proposition}`)
-            if ((d.key_features as string[])?.length) parts.push(`Key Features: ${(d.key_features as string[]).join(', ')}`)
-            if ((d.differentiators as string[])?.length) parts.push(`Differentiators: ${(d.differentiators as string[]).join(', ')}`)
-            if ((d.target_outcomes as string[])?.length) parts.push(`Target Outcomes: ${(d.target_outcomes as string[]).join(', ')}`)
-            // Append conversation history for full context
-            const histCtx = history.map(r => `${r.role === 'user' ? 'User' : 'AI'}: ${r.content}`).join('\n')
-            if (histCtx) parts.push('\nConversation:\n' + histCtx)
-            accumulatedContext = parts.join('\n')
-          }
+        proc.stderr.on('data', (chunk: Buffer) => {
+          console.error('[claude stream stderr]', chunk.toString().slice(0, 200))
+        })
 
-          // Trigger stages in order, streaming each stage_task_id back to client
-          let lastTaskId: string | null = null
-          for (const sig of stageSignals) {
-            const stageTaskId = await triggerSingleStage(sig.stage, session_id, sig.data, accumulatedContext)
-            if (stageTaskId) {
-              lastTaskId = stageTaskId
-              controller.enqueue(enc.encode(`data: ${JSON.stringify({ stage_signal: sig.stage, stage_task_id: stageTaskId })}\n\n`))
+        proc.on('close', async (code) => {
+          try {
+            if (fullContent.trim()) {
+              await sql`
+                INSERT INTO strategy_chats (session_id, agent_name, role, content)
+                VALUES (${session_id}, ${agent ?? 'profile_builder_web'}, 'assistant', ${fullContent})
+              `
             }
-          }
 
-          // Save context + pipeline task ID if we triggered anything
-          if (accumulatedContext && lastTaskId) {
-            await sql`
-              UPDATE strategy_sessions
-              SET context_text = ${accumulatedContext}, pipeline_task_id = ${lastTaskId}, updated_at = NOW()
-              WHERE id = ${session_id}
-            `
-          }
+            // Detect ALL stage signals from completed content (some may have been missed mid-stream due to chunk boundaries)
+            const stageSignals: Array<{ stage: string; data: Record<string, unknown> }> = []
+            let accumulatedContext = ''
 
-          // Persist confirmed artifact state
-          if (stageSignals.length > 0) {
-            const updatedState: ArtifactConfirmedState = { ...artifactState }
+            const jsonBlocks = [...fullContent.matchAll(/```json\s*([\s\S]*?)```/g)]
+            for (const match of jsonBlocks) {
+              try {
+                const parsed = JSON.parse(match[1].trim()) as Record<string, unknown>
+                if (typeof parsed.stage_signal === 'string') {
+                  stageSignals.push({ stage: parsed.stage_signal, data: parsed })
+                }
+                if (parsed.work_complete === true) {
+                  stageSignals.push({ stage: 'company_profiler', data: parsed })
+                  stageSignals.push({ stage: 'icp_builder', data: parsed })
+                  stageSignals.push({ stage: 'competition_researcher', data: parsed })
+                  stageSignals.push({ stage: 'scoring_rubric_builder', data: parsed })
+                  stageSignals.push({ stage: 'profile_writer', data: parsed })
+                }
+              } catch {}
+            }
+
+            // Build context text from company_profiler signal
+            const companySignal = stageSignals.find(s => s.stage === 'company_profiler')
+            if (companySignal) {
+              const d = companySignal.data
+              const parts: string[] = []
+              if (d.company_name)        parts.push(`Company: ${d.company_name}`)
+              if (d.domain)              parts.push(`Domain: ${d.domain}`)
+              if (d.product_description) parts.push(`Product: ${d.product_description}`)
+              if (d.value_proposition)   parts.push(`Value Proposition: ${d.value_proposition}`)
+              if ((d.key_features as string[])?.length) parts.push(`Key Features: ${(d.key_features as string[]).join(', ')}`)
+              if ((d.differentiators as string[])?.length) parts.push(`Differentiators: ${(d.differentiators as string[]).join(', ')}`)
+              if ((d.target_outcomes as string[])?.length) parts.push(`Target Outcomes: ${(d.target_outcomes as string[]).join(', ')}`)
+              const histCtx = history.map(r => `${r.role === 'user' ? 'User' : 'AI'}: ${r.content}`).join('\n')
+              if (histCtx) parts.push('\nConversation:\n' + histCtx)
+              accumulatedContext = parts.join('\n')
+            }
+
+            // Trigger pipeline stages in order
+            let lastTaskId: string | null = null
             for (const sig of stageSignals) {
-              const key = sig.stage as keyof ArtifactConfirmedState
-              updatedState[key] = { confirmed: true, data: sig.data }
+              const stageTaskId = await triggerSingleStage(sig.stage, session_id, sig.data, accumulatedContext)
+              if (stageTaskId) {
+                lastTaskId = stageTaskId
+                send({ stage_signal: sig.stage, stage_task_id: stageTaskId })
+              }
             }
-            await sql`
-              UPDATE strategy_sessions
-              SET artifact_state = ${JSON.stringify(updatedState)}, updated_at = NOW()
-              WHERE id = ${session_id}
-            `
-          }
 
-          // Legacy: emit pipeline_task_id for the last task started
-          if (lastTaskId) {
-            controller.enqueue(enc.encode(`data: ${JSON.stringify({ pipeline_task_id: lastTaskId })}\n\n`))
-          }
+            // Persist context + task ID
+            if (accumulatedContext && lastTaskId) {
+              await sql`
+                UPDATE strategy_sessions
+                SET context_text = ${accumulatedContext}, pipeline_task_id = ${lastTaskId}, updated_at = NOW()
+                WHERE id = ${session_id}
+              `
+            }
 
+            // Persist confirmed artifact state
+            if (stageSignals.length > 0) {
+              const updatedState: ArtifactConfirmedState = { ...artifactState }
+              for (const sig of stageSignals) {
+                const key = sig.stage as keyof ArtifactConfirmedState
+                updatedState[key] = { confirmed: true, data: sig.data }
+              }
+              await sql`
+                UPDATE strategy_sessions
+                SET artifact_state = ${JSON.stringify(updatedState)}, updated_at = NOW()
+                WHERE id = ${session_id}
+              `
+            }
+
+            if (lastTaskId) send({ pipeline_task_id: lastTaskId })
+            controller.enqueue(enc.encode('data: [DONE]\n\n'))
+            controller.close()
+          } catch (err) {
+            controller.error(err)
+          }
+          if (code !== 0) console.error('[claude stream] exited with code', code)
+        })
+
+        proc.on('error', err => controller.error(err))
+
+      } catch (err) {
+        try {
           controller.enqueue(enc.encode('data: [DONE]\n\n'))
           controller.close()
-        } catch (err) {
-          controller.error(err)
-        }
-        if (code !== 0) console.error('[claude stream] exited with code', code)
-      })
-
-      proc.on('error', err => controller.error(err))
+        } catch {}
+        console.error('[strategy stream] error', err)
+      }
     },
   })
 
