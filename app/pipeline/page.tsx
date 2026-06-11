@@ -1,845 +1,619 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useRouter } from 'next/navigation'
-import { Plus, X, ChevronRight, Loader2, AlertCircle, RefreshCw, Zap, Terminal, LayoutList, LayoutGrid, CheckCircle } from 'lucide-react'
+import { Loader2, CheckCircle, AlertCircle, ChevronDown, ChevronRight, Play, RotateCcw, Key, Settings } from 'lucide-react'
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-interface ScoredLead {
-  company_name: string
-  domain: string
-  score: number
-  grade: string
-  passed_threshold: boolean
-  icp_match: {
-    industry_match: boolean
-    size_match: boolean
-    stage_match: boolean
-    geo_match: boolean
-    trigger_signals: string[]
-  }
-  disqualifier_hit: string | null
-  rationale: string
+type StageKey = 'lead_researcher' | 'lead_scorer' | 'deep_researcher' | 'outreach_designer' | 'email_composer' | 'email_sender'
+type StageStatus = 'idle' | 'running' | 'completed' | 'failed'
+
+interface StageState {
+  status:    StageStatus
+  taskId:    string | null
+  artifact:  Record<string, unknown> | null
+  startedAt: string | null
+  error:     string | null
 }
 
-interface Lead {
-  id: string
-  company: string
-  domain: string
-  industry: string
-  score: number
-  grade: string
-  badges: string[]
-  column: string
-  rationale: string
-  passed_threshold: boolean
-  icp_match: ScoredLead['icp_match']
+interface RunConfig {
+  dryRun:          boolean
+  clayApiKey:      string
+  maxLeads:        number
+  scoringThreshold: number
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const STAGE_META: { key: StageKey; label: string; artifact: string; description: string; needsClay: boolean }[] = [
+  { key: 'lead_researcher',   label: 'Lead Research',       artifact: 'leads_raw',         description: 'Finds companies matching your ICP profile',                       needsClay: true  },
+  { key: 'lead_scorer',       label: 'Lead Scoring',        artifact: 'scored_leads',      description: 'Scores each lead against your rubric and ICP criteria',           needsClay: false },
+  { key: 'deep_researcher',   label: 'Deep Research',       artifact: 'enriched_leads',    description: 'Enriches qualified leads with news, decision maker, and hooks',   needsClay: true  },
+  { key: 'outreach_designer', label: 'Outreach Design',     artifact: 'outreach_strategy', description: 'Designs your outreach sequence, tone, CTAs, and personalisation', needsClay: false },
+  { key: 'email_composer',    label: 'Email Drafting',      artifact: 'email_drafts',      description: 'Writes personalised cold emails guided by the outreach strategy',  needsClay: false },
+  { key: 'email_sender',      label: 'Save Drafts',         artifact: 'emails_saved',      description: 'Saves email drafts to the database — no emails sent automatically', needsClay: false },
+]
 
-const ACTIVE_STATUSES = new Set(['open', 'running', 'active', 'in_progress'])
+const STAGE_ORDER: StageKey[] = STAGE_META.map(s => s.key)
 
-function scoreToColumn(lead: ScoredLead): string {
-  if (!lead.passed_threshold) return 'researched'
-  if (lead.score >= 100) return 'shortlisted'
-  if (lead.score >= 80) return 'scored'
-  return 'researched'
+const EMPTY_STAGE: StageState = { status: 'idle', taskId: null, artifact: null, startedAt: null, error: null }
+
+const LS_KEY = 'sdr_pipeline_v2'
+
+function initialStages(): Record<StageKey, StageState> {
+  return Object.fromEntries(STAGE_META.map(s => [s.key, { ...EMPTY_STAGE }])) as Record<StageKey, StageState>
 }
 
-function icpMatchBadges(lead: ScoredLead): string[] {
-  const badges: string[] = []
-  const signals = lead.icp_match?.trigger_signals ?? []
-  if (signals.length > 0) badges.push(...signals.slice(0, 2))
-  if (lead.icp_match?.geo_match) badges.push('Geo ✓')
-  return badges.slice(0, 3)
+function loadLS(): { stages: Record<StageKey, StageState>; config: RunConfig } | null {
+  if (typeof window === 'undefined') return null
+  try { return JSON.parse(localStorage.getItem(LS_KEY) ?? 'null') } catch { return null }
 }
 
-function mapScoredLeads(rawLeads: ScoredLead[]): Lead[] {
-  return rawLeads.map(l => ({
-    id: l.domain,
-    company: l.company_name,
-    domain: l.domain,
-    industry: `Grade ${l.grade}`,
-    score: l.score,
-    grade: l.grade,
-    badges: icpMatchBadges(l),
-    column: scoreToColumn(l),
-    rationale: l.rationale ?? '',
-    passed_threshold: l.passed_threshold,
-    icp_match: l.icp_match,
-  }))
+function saveLS(stages: Record<StageKey, StageState>, config: RunConfig) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify({ stages, config })) } catch {}
 }
 
-function parseContent(raw: string | null | undefined): Record<string, unknown> | null {
-  if (!raw) return null
+// ─── Stage summary helpers ────────────────────────────────────────────────────
+
+function stageSummary(key: StageKey, art: Record<string, unknown> | null): string {
+  if (!art) return ''
   try {
-    const cleaned = raw.replace(/^\s*\d+\s*\|\s?/gm, '')
-    return JSON.parse(cleaned)
-  } catch {
-    return null
+    if (key === 'lead_researcher') {
+      const n = (art.leads as unknown[])?.length ?? art.total_found ?? 0
+      return `${n} leads found`
+    }
+    if (key === 'lead_scorer') {
+      const q = art.qualified_count ?? 0
+      const t = art.total_scored ?? 0
+      return `${q}/${t} qualified`
+    }
+    if (key === 'deep_researcher') {
+      const n = art.total_enriched ?? (art.enriched_leads as unknown[])?.length ?? 0
+      return `${n} leads enriched`
+    }
+    if (key === 'outreach_designer') {
+      const touches = (art.sequence as Record<string, unknown>)?.total_touches ?? '?'
+      return `${touches}-touch sequence`
+    }
+    if (key === 'email_composer') {
+      const n = art.total_drafted ?? (art.drafts as unknown[])?.length ?? 0
+      return `${n} emails drafted`
+    }
+    if (key === 'email_sender') {
+      const n = art.saved_count ?? 0
+      return `${n} drafts saved`
+    }
+  } catch {}
+  return ''
+}
+
+// ─── Artifact preview ─────────────────────────────────────────────────────────
+
+function ArtifactPreview({ stageKey, data }: { stageKey: StageKey; data: Record<string, unknown> }) {
+  if (stageKey === 'lead_researcher') {
+    const leads = (data.leads as Array<Record<string, unknown>>) ?? []
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {leads.slice(0, 8).map((l, i) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '5px 10px', background: 'var(--paper-2)', borderRadius: 4, fontSize: 12 }}>
+            <span style={{ fontWeight: 600, color: 'var(--ink)', minWidth: 160 }}>{String(l.company_name ?? '—')}</span>
+            <span style={{ color: 'var(--ink-4)', fontFamily: 'monospace', fontSize: 11 }}>{String(l.domain ?? '')}</span>
+            <span style={{ marginLeft: 'auto', color: 'var(--ink-3)', fontSize: 11 }}>{String(l.industry ?? '')} · {String(l.geography ?? '')}</span>
+          </div>
+        ))}
+        {leads.length > 8 && <div style={{ fontSize: 11, color: 'var(--ink-4)', padding: '2px 10px' }}>+{leads.length - 8} more</div>}
+      </div>
+    )
   }
-}
 
-// ---------------------------------------------------------------------------
-// Static fallback leads shown when no pipeline has run
-// ---------------------------------------------------------------------------
-const EMPTY_ICP: ScoredLead['icp_match'] = { industry_match: false, size_match: false, stage_match: false, geo_match: false, trigger_signals: [] }
-
-const STATIC_LEADS: Lead[] = [
-  { id: 'lt-construction', company: 'L&T Construction', domain: 'larsentoubro.com', industry: 'EPC · General Contracting', score: 91, grade: 'A', badges: ['India', 'Existing customer'], column: 'scored', rationale: 'Tier 1 contractor with active large-scale infrastructure projects.', passed_threshold: true, icp_match: { industry_match: true, size_match: true, stage_match: true, geo_match: true, trigger_signals: ['India', 'Existing customer'] } },
-  { id: 'godrej-properties', company: 'Godrej Properties', domain: 'godrejproperties.com', industry: 'Real Estate Development', score: 88, grade: 'A', badges: ['India'], column: 'scored', rationale: 'Large residential developer with ongoing construction sites.', passed_threshold: true, icp_match: { industry_match: true, size_match: true, stage_match: false, geo_match: true, trigger_signals: ['India'] } },
-  { id: 'embassy-group', company: 'Embassy Group', domain: 'embassygroup.in', industry: 'Real Estate · Commercial', score: 94, grade: 'A', badges: ['India', 'Series B'], column: 'shortlisted', rationale: 'Commercial real estate developer expanding rapidly across India.', passed_threshold: true, icp_match: { industry_match: true, size_match: true, stage_match: true, geo_match: true, trigger_signals: ['India', 'Series B'] } },
-  { id: 'damac-properties', company: 'DAMAC Properties', domain: 'damac.com', industry: 'Real Estate Development', score: 86, grade: 'A', badges: ['UAE', 'New VP Ops'], column: 'shortlisted', rationale: 'MENA developer with high-volume material handling requirements.', passed_threshold: true, icp_match: { industry_match: true, size_match: true, stage_match: false, geo_match: true, trigger_signals: ['UAE', 'New VP Ops'] } },
-  { id: 'tata-projects', company: 'Tata Projects', domain: 'tata.com', industry: 'General Contracting', score: 62, grade: 'B', badges: ['India'], column: 'researched', rationale: 'General contractor but limited recent activity signals.', passed_threshold: false, icp_match: { industry_match: true, size_match: true, stage_match: false, geo_match: true, trigger_signals: [] } },
-  { id: 'acc-limited', company: 'ACC Limited', domain: 'acclimited.com', industry: 'Building Materials', score: 45, grade: 'C', badges: ['India'], column: 'researched', rationale: 'Materials company — not a construction contractor.', passed_threshold: false, icp_match: { ...EMPTY_ICP, geo_match: true } },
-]
-
-const columns = [
-  { key: 'researched', label: 'Researched' },
-  { key: 'scored', label: 'Scored' },
-  { key: 'shortlisted', label: 'Shortlisted' },
-  { key: 'sequencing', label: 'Sequencing' },
-  { key: 'handoff', label: 'Handoff' },
-]
-
-// ---------------------------------------------------------------------------
-// Score badge
-// ---------------------------------------------------------------------------
-function ScoreBadge({ score, grade }: { score: number; grade: string }) {
-  const isA = grade === 'A'
-  const isB = grade === 'B'
-  const bg = isA ? 'var(--good-soft)' : isB ? 'var(--warn-soft)' : 'var(--accent-soft)'
-  const color = isA ? 'var(--good)' : isB ? 'var(--warn)' : 'var(--bad)'
-  return (
-    <span style={{
-      fontSize: '10.5px', fontWeight: 600,
-      background: bg, color,
-      padding: '1px 6px', borderRadius: '3px',
-      whiteSpace: 'nowrap',
-    }}>
-      {score} · {grade}
-    </span>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Kanban card
-// ---------------------------------------------------------------------------
-function KanbanCard({
-  lead, selected, onToggle,
-}: {
-  lead: Lead
-  selected: boolean
-  onToggle: (id: string) => void
-}) {
-  const [hovered, setHovered] = useState(false)
-
-  return (
-    <div
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        background: selected ? 'var(--accent-tint)' : 'white',
-        border: `1px solid ${selected ? 'var(--accent)' : hovered ? 'var(--line-2)' : 'var(--line)'}`,
-        borderRadius: '5px', padding: '10px 12px', cursor: 'pointer',
-        transform: hovered && !selected ? 'translateY(-1px)' : 'none',
-        boxShadow: hovered ? '0 2px 8px rgba(26,24,20,0.08)' : 'none',
-        transition: 'transform 0.1s, box-shadow 0.1s, border-color 0.1s, background 0.1s',
-        position: 'relative',
-      }}
-    >
-      {/* Checkbox */}
-      <div
-        onClick={e => { e.stopPropagation(); onToggle(lead.id) }}
-        style={{
-          position: 'absolute', top: '10px', right: '10px',
-          width: '14px', height: '14px',
-          border: `1.5px solid ${selected ? 'var(--accent)' : 'var(--line-2)'}`,
-          borderRadius: '3px',
-          background: selected ? 'var(--accent)' : 'white',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          opacity: hovered || selected ? 1 : 0,
-          transition: 'opacity 0.1s', cursor: 'pointer',
-        }}
-      >
-        {selected && (
-          <svg width="8" height="6" viewBox="0 0 8 6" fill="none">
-            <path d="M1 3L3 5L7 1" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        )}
+  if (stageKey === 'lead_scorer') {
+    const leads = (data.scored_leads as Array<Record<string, unknown>>) ?? []
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {leads.slice(0, 8).map((l, i) => {
+          const passed = Boolean(l.passed_threshold)
+          const score = Number(l.score ?? 0)
+          const grade = String(l.grade ?? '?')
+          const gradeColor = grade === 'A' ? 'var(--good)' : grade === 'B' ? 'var(--warn)' : 'var(--bad)'
+          return (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '5px 10px', background: passed ? 'var(--good-soft)' : 'var(--paper-2)', borderRadius: 4, fontSize: 12, borderLeft: `3px solid ${passed ? 'var(--good)' : 'var(--line)'}` }}>
+              <span style={{ fontWeight: 600, color: 'var(--ink)', minWidth: 160 }}>{String(l.company_name ?? '—')}</span>
+              <span style={{ fontWeight: 700, color: gradeColor, fontSize: 11, padding: '1px 6px', background: 'white', borderRadius: 3, border: `1px solid ${gradeColor}` }}>{score} · {grade}</span>
+              <span style={{ color: passed ? 'var(--good)' : 'var(--ink-4)', fontSize: 11 }}>{passed ? '✓ Qualified' : '✗ Below threshold'}</span>
+              <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--ink-4)', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{String(l.rationale ?? '')}</span>
+            </div>
+          )
+        })}
+        {leads.length > 8 && <div style={{ fontSize: 11, color: 'var(--ink-4)', padding: '2px 10px' }}>+{leads.length - 8} more</div>}
       </div>
+    )
+  }
 
-      <div style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--ink)', marginBottom: '2px', paddingRight: '20px', lineHeight: 1.3 }}>
-        {lead.company}
+  if (stageKey === 'deep_researcher') {
+    const leads = (data.enriched_leads as Array<Record<string, unknown>>) ?? []
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {leads.slice(0, 6).map((l, i) => {
+          const dm = (l.decision_maker as Record<string, unknown>) ?? {}
+          const hooks = (l.personalization_hooks as string[]) ?? []
+          return (
+            <div key={i} style={{ padding: '7px 10px', background: 'var(--paper-2)', borderRadius: 4, fontSize: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <span style={{ fontWeight: 600, color: 'var(--ink)' }}>{String(l.company_name ?? '—')}</span>
+                {dm.name ? <span style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 500 }}>{String(dm.name)} · {String(dm.title ?? '')}</span> : null}
+              </div>
+              {hooks[0] && <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.4 }}>↳ {String(hooks[0])}</div>}
+            </div>
+          )
+        })}
       </div>
-      <div style={{ fontSize: '10.5px', color: 'var(--ink-3)', fontFamily: "'JetBrains Mono', monospace", marginBottom: '8px' }}>
-        {lead.domain}
-      </div>
-      <div style={{ fontSize: '11px', color: 'var(--ink-3)', marginBottom: '8px', lineHeight: 1.3 }}>
-        {lead.industry}
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '8px' }}>
-        <span style={{ fontSize: '10.5px', color: 'var(--ink-4)' }}>Score</span>
-        <ScoreBadge score={lead.score} grade={lead.grade} />
-      </div>
-      {lead.rationale && (
-        <div style={{ fontSize: '10.5px', color: 'var(--ink-4)', lineHeight: 1.4, marginBottom: '6px' }}>
-          {lead.rationale.slice(0, 80)}{lead.rationale.length > 80 ? '…' : ''}
+    )
+  }
+
+  if (stageKey === 'outreach_designer') {
+    const seq = (data.sequence as Record<string, unknown>) ?? {}
+    const steps = (seq.steps as Array<Record<string, unknown>>) ?? []
+    const tone = (data.tone_and_voice as Record<string, unknown>) ?? {}
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          <span style={{ fontWeight: 600, color: 'var(--ink)' }}>{steps.length}-touch sequence</span>
+          {tone.overall_tone ? <span> · Tone: {String(tone.overall_tone)}</span> : null}
         </div>
-      )}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-        {lead.badges.map((badge, i) => (
-          <span key={i} style={{
-            fontSize: '10px', fontWeight: 500,
-            background: 'var(--paper-2)', color: 'var(--ink-2)',
-            padding: '1px 5px', borderRadius: '3px',
-            border: '1px solid var(--line)',
-          }}>
-            {badge}
-          </span>
+        {steps.slice(0, 4).map((s, i) => (
+          <div key={i} style={{ display: 'flex', gap: 8, padding: '4px 10px', background: 'var(--paper-2)', borderRadius: 4, fontSize: 11 }}>
+            <span style={{ color: 'var(--accent)', fontWeight: 700, minWidth: 20 }}>{i + 1}</span>
+            <span style={{ color: 'var(--ink-2)', fontWeight: 500 }}>{String(s.channel ?? '—')}</span>
+            <span style={{ color: 'var(--ink-4)' }}>{String(s.timing ?? '')}</span>
+            <span style={{ color: 'var(--ink-3)', flex: 1 }}>{String(s.purpose ?? '')}</span>
+          </div>
         ))}
       </div>
-    </div>
-  )
+    )
+  }
+
+  if (stageKey === 'email_composer') {
+    const drafts = (data.drafts as Array<Record<string, unknown>>) ?? []
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {drafts.slice(0, 4).map((d, i) => {
+          const emails = (d.emails as Array<Record<string, unknown>>) ?? []
+          const first = emails[0] ?? {}
+          return (
+            <div key={i} style={{ padding: '7px 10px', background: 'var(--paper-2)', borderRadius: 4 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)', marginBottom: 2 }}>
+                {String(d.company_name ?? d.domain ?? `Lead ${i + 1}`)}
+              </div>
+              {first.subject ? <div style={{ fontSize: 11, color: 'var(--accent)', marginBottom: 2 }}>Subject: {String(first.subject)}</div> : null}
+              {first.body ? <div style={{ fontSize: 11, color: 'var(--ink-4)', lineHeight: 1.4, maxHeight: 40, overflow: 'hidden' }}>{String(first.body).slice(0, 120)}…</div> : null}
+            </div>
+          )
+        })}
+        {drafts.length > 4 && <div style={{ fontSize: 11, color: 'var(--ink-4)', padding: '2px 10px' }}>+{drafts.length - 4} more</div>}
+      </div>
+    )
+  }
+
+  if (stageKey === 'email_sender') {
+    return (
+      <div style={{ fontSize: 13, color: 'var(--good)', padding: '8px 12px', background: 'var(--good-soft)', borderRadius: 6 }}>
+        ✓ {String(data.saved_count ?? 0)} email drafts saved to database
+      </div>
+    )
+  }
+
+  return <pre style={{ fontSize: 11, color: 'var(--ink-3)', maxHeight: 120, overflow: 'auto' }}>{JSON.stringify(data, null, 2).slice(0, 600)}</pre>
 }
 
-// ---------------------------------------------------------------------------
-// ICP dot row (shared between table and kanban)
-// ---------------------------------------------------------------------------
-function IcpDims({ match }: { match: Lead['icp_match'] }) {
-  const dims = [
-    { label: 'Ind', ok: match?.industry_match },
-    { label: 'Size', ok: match?.size_match },
-    { label: 'Geo', ok: match?.geo_match },
-    { label: 'Stage', ok: match?.stage_match },
-  ]
-  return (
-    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-      {dims.map(d => (
-        <span key={d.label} style={{
-          fontSize: '9.5px', display: 'inline-flex', alignItems: 'center', gap: '2px',
-          color: d.ok ? 'var(--good)' : 'var(--ink-4)',
-          padding: '1px 4px', borderRadius: '3px',
-          background: d.ok ? 'var(--good-soft)' : 'var(--paper-3)',
-        }}>
-          {d.ok ? <CheckCircle size={8} /> : null}
-          {d.label}
-        </span>
-      ))}
-    </div>
-  )
-}
+// ─── Stage card ───────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Table row
-// ---------------------------------------------------------------------------
-function LeadTableRow({ lead, selected, onToggle }: { lead: Lead; selected: boolean; onToggle: (id: string) => void }) {
-  const [hovered, setHovered] = useState(false)
+function StageCard({
+  meta, state, index, canRun, onRun, onRerun,
+}: {
+  meta: typeof STAGE_META[0]
+  state: StageState
+  index: number
+  canRun: boolean
+  onRun: () => void
+  onRerun: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const isRunning   = state.status === 'running'
+  const isCompleted = state.status === 'completed'
+  const isFailed    = state.status === 'failed'
+  const isIdle      = state.status === 'idle'
+
+  const borderColor = isCompleted ? 'var(--good)' : isRunning ? 'var(--accent)' : isFailed ? 'var(--bad)' : 'var(--line)'
+  const summary = stageSummary(meta.key, state.artifact)
+
   return (
-    <tr
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onClick={() => onToggle(lead.id)}
-      style={{
-        background: selected ? 'var(--accent-tint)' : hovered ? 'var(--paper-2)' : 'transparent',
-        borderLeft: selected ? '3px solid var(--accent)' : '3px solid transparent',
-        cursor: 'pointer',
-        transition: 'background 0.1s',
-      }}
-    >
-      {/* Checkbox */}
-      <td style={{ padding: '8px 10px', width: '28px' }}>
+    <div style={{
+      border: `1.5px solid ${borderColor}`,
+      borderRadius: 8,
+      background: isCompleted ? 'white' : isRunning ? '#f8f7ff' : 'var(--paper)',
+      transition: 'border-color 0.2s, background 0.2s',
+      overflow: 'hidden',
+    }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px' }}>
+        {/* Step number / status icon */}
         <div style={{
-          width: '14px', height: '14px',
-          border: `1.5px solid ${selected ? 'var(--accent)' : 'var(--line-2)'}`,
-          borderRadius: '3px',
-          background: selected ? 'var(--accent)' : 'white',
+          width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          opacity: hovered || selected ? 1 : 0,
-          transition: 'opacity 0.1s',
+          background: isCompleted ? 'var(--good)' : isRunning ? 'var(--accent)' : isFailed ? 'var(--bad)' : 'var(--paper-2)',
+          color: isCompleted || isRunning || isFailed ? 'white' : 'var(--ink-4)',
+          fontSize: 12, fontWeight: 700,
         }}>
-          {selected && <svg width="8" height="6" viewBox="0 0 8 6" fill="none"><path d="M1 3L3 5L7 1" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>}
+          {isRunning  ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> :
+           isCompleted ? <CheckCircle size={13} /> :
+           isFailed    ? <AlertCircle size={13} /> :
+           index + 1}
         </div>
-      </td>
-      {/* Company */}
-      <td style={{ padding: '8px 10px', minWidth: '180px' }}>
-        <div style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--ink)', marginBottom: '1px' }}>{lead.company}</div>
-        <div style={{ fontSize: '10.5px', color: 'var(--ink-4)', fontFamily: "'JetBrains Mono', monospace" }}>{lead.domain}</div>
-      </td>
-      {/* Score */}
-      <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>
-        <ScoreBadge score={lead.score} grade={lead.grade} />
-      </td>
-      {/* Passed */}
-      <td style={{ padding: '8px 10px' }}>
-        <span style={{
-          fontSize: '10px', fontWeight: 600,
-          background: lead.passed_threshold ? 'var(--good-soft)' : 'var(--paper-3)',
-          color: lead.passed_threshold ? 'var(--good)' : 'var(--ink-4)',
-          padding: '2px 7px', borderRadius: '3px',
-        }}>
-          {lead.passed_threshold ? '✓ Passed' : '✗ Below threshold'}
-        </span>
-      </td>
-      {/* ICP dims */}
-      <td style={{ padding: '8px 10px' }}>
-        <IcpDims match={lead.icp_match} />
-      </td>
-      {/* Signals */}
-      <td style={{ padding: '8px 10px' }}>
-        <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-          {(lead.icp_match?.trigger_signals ?? []).slice(0, 2).map((s, i) => (
-            <span key={i} style={{ fontSize: '10px', background: 'var(--paper-2)', color: 'var(--ink-3)', padding: '1px 6px', borderRadius: '3px', border: '1px solid var(--line)', whiteSpace: 'nowrap' }}>
-              {s}
-            </span>
-          ))}
+
+        {/* Label + description */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ink)' }}>{meta.label}</span>
+            {meta.needsClay && (
+              <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--info)', background: 'var(--info-soft)', padding: '1px 6px', borderRadius: 3 }}>Clay</span>
+            )}
+            {isCompleted && summary && (
+              <span style={{ fontSize: 11, color: 'var(--good)', fontWeight: 500 }}>· {summary}</span>
+            )}
+            {isRunning && (
+              <span style={{ fontSize: 11, color: 'var(--accent)' }}>Running…</span>
+            )}
+            {isFailed && state.error && (
+              <span style={{ fontSize: 11, color: 'var(--bad)' }}>Failed: {state.error}</span>
+            )}
+          </div>
+          <div style={{ fontSize: 11.5, color: 'var(--ink-4)', marginTop: 1 }}>{meta.description}</div>
         </div>
-      </td>
-      {/* Rationale */}
-      <td style={{ padding: '8px 12px', maxWidth: '280px' }}>
-        <div style={{ fontSize: '11.5px', color: 'var(--ink-3)', lineHeight: 1.4 }}>
-          {lead.rationale ? `${lead.rationale.slice(0, 90)}${lead.rationale.length > 90 ? '…' : ''}` : '—'}
+
+        {/* Actions */}
+        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+          {isCompleted && (
+            <button
+              onClick={() => setExpanded(e => !e)}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--ink-3)', background: 'var(--paper-2)', border: '1px solid var(--line)', borderRadius: 5, padding: '4px 10px', cursor: 'pointer' }}
+            >
+              {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+              Results
+            </button>
+          )}
+          {isCompleted && (
+            <button
+              onClick={onRerun}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--ink-3)', background: 'var(--paper)', border: '1px solid var(--line)', borderRadius: 5, padding: '4px 10px', cursor: 'pointer' }}
+            >
+              <RotateCcw size={11} /> Re-run
+            </button>
+          )}
+          {(isIdle || isFailed) && (
+            <button
+              onClick={onRun}
+              disabled={!canRun}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                fontSize: 12, fontWeight: 600,
+                color: canRun ? 'white' : 'var(--ink-4)',
+                background: canRun ? 'var(--accent)' : 'var(--paper-2)',
+                border: `1px solid ${canRun ? 'var(--accent)' : 'var(--line)'}`,
+                borderRadius: 5, padding: '5px 14px', cursor: canRun ? 'pointer' : 'not-allowed',
+                transition: 'background 0.15s',
+              }}
+            >
+              <Play size={11} /> Run
+            </button>
+          )}
+          {isRunning && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--accent)', padding: '5px 12px' }}>
+              <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} /> Running
+            </div>
+          )}
         </div>
-      </td>
-    </tr>
+      </div>
+
+      {/* Expanded results */}
+      {expanded && isCompleted && state.artifact && (
+        <div style={{ padding: '0 16px 14px', borderTop: '1px solid var(--line)' }}>
+          <div style={{ paddingTop: 12 }}>
+            <ArtifactPreview stageKey={meta.key} data={state.artifact} />
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
+// ─── Page ──────────────────────────────────────────────────────────────────────
+
 export default function PipelinePage() {
-  const router = useRouter()
-  const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [leads, setLeads] = useState<Lead[]>(STATIC_LEADS)
-  const [runState, setRunState] = useState<'idle' | 'loading' | 'error'>('idle')
-  const [runError, setRunError] = useState<string | null>(null)
-  const [dataSource, setDataSource] = useState<string | null>(null)
-  const [refreshing, setRefreshing] = useState(false)
-  const [activePipelineTaskId, setActivePipelineTaskId] = useState<string | null>(null)
-  const activeTaskPollRef = useRef<NodeJS.Timeout | null>(null)
-  const [companyName, setCompanyName] = useState<string>('Your Company')
-  const [viewMode, setViewMode] = useState<'kanban' | 'list'>('kanban')
-  const [filterGrade, setFilterGrade] = useState<'all' | 'A' | 'B' | 'C'>('all')
-  const [filterPassed, setFilterPassed] = useState<'all' | 'passed' | 'failed'>('all')
+  const [stages, setStages] = useState<Record<StageKey, StageState>>(initialStages)
+  const [config, setConfig] = useState<RunConfig>({ dryRun: true, clayApiKey: '', maxLeads: 10, scoringThreshold: 0.75 })
+  const [showConfig, setShowConfig] = useState(false)
+  const [companyName, setCompanyName] = useState('Flo Mobility')
+  const pollRefs = useRef<Record<string, NodeJS.Timeout>>({})
 
-  const loadLeads = useCallback(async (quiet = false) => {
-    if (!quiet) return
-    setRefreshing(true)
-    try {
-      const tasksRes = await fetch('/api/tasks', { cache: 'no-store' })
-      const tasksData = await tasksRes.json()
-      const allTasks: Array<{ id: string; name: string; status: string; created_at: string }> = tasksData.tasks ?? []
-      const latestPipeline = allTasks
-        .filter(t => t.name === 'sdr:core:sales-pipeline' && t.status === 'completed')
-        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
-
-      if (!latestPipeline) {
-        setRefreshing(false)
-        return
-      }
-
-      const artRes = await fetch(`/api/tasks/${latestPipeline.id}/artifacts`, { cache: 'no-store' })
-      const artData = await artRes.json()
-      const arts: Array<{ id: string; entry_name: string }> = artData.artifacts ?? []
-
-      const scoredArt = arts.find(a => a.entry_name === 'scored_leads')
-      if (!scoredArt) {
-        setRefreshing(false)
-        return
-      }
-
-      const contentRes = await fetch(`/api/artifacts/${scoredArt.id}`, { cache: 'no-store' })
-      const contentData = await contentRes.json()
-      const parsed = parseContent(contentData.artifact?.content)
-
-      if (parsed?.scored_leads && Array.isArray(parsed.scored_leads)) {
-        const mapped = mapScoredLeads(parsed.scored_leads as ScoredLead[])
-        setLeads(mapped)
-        setDataSource(latestPipeline.id)
-      }
-    } catch {}
-    setRefreshing(false)
-  }, [])
-
-  const checkActiveTasks = useCallback(async () => {
-    try {
-      const res = await fetch('/api/tasks', { cache: 'no-store' })
-      const data = await res.json()
-      const allTasks: Array<{ id: string; name: string; status: string; created_at: string }> = data.tasks ?? []
-      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
-      // Only count tasks created within the last 2 hours as truly active (avoids stale "open" tasks)
-      const active = allTasks.find(t =>
-        t.name === 'sdr:core:sales-pipeline' &&
-        ACTIVE_STATUSES.has(t.status) &&
-        new Date(t.created_at) > twoHoursAgo
-      )
-      setActivePipelineTaskId(active?.id ?? null)
-    } catch {}
-  }, [])
-
-  // Fetch company name from latest profile-builder profile_documents artifact
+  // Load from localStorage on mount
   useEffect(() => {
-    async function fetchCompanyName() {
-      try {
-        const tasksRes = await fetch('/api/tasks', { cache: 'no-store' })
-        const tasksData = await tasksRes.json()
-        const allTasks: Array<{ id: string; name: string; status: string; created_at: string }> = tasksData.tasks ?? []
-        const latestPB = allTasks
-          .filter(t => t.name === 'sdr:core:profile-builder' && t.status === 'completed')
+    const saved = loadLS()
+    if (saved) {
+      setStages(saved.stages)
+      setConfig(saved.config)
+    }
+  }, [])
+
+  // Load company name from profile-builder
+  useEffect(() => {
+    fetch('/api/tasks', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(async d => {
+        const tasks: Array<{ id: string; name: string; status: string; created_at: string }> = d.tasks ?? []
+        const pb = tasks.filter(t => t.name === 'sdr:core:profile-builder' && t.status === 'completed')
           .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
-        if (!latestPB) return
-        const artRes = await fetch(`/api/tasks/${latestPB.id}/artifacts`, { cache: 'no-store' })
-        const artData = await artRes.json()
-        const pdArt = (artData.artifacts ?? []).find((a: { entry_name: string }) => a.entry_name === 'profile_documents')
-        if (!pdArt) return
-        const contentRes = await fetch(`/api/artifacts/${(pdArt as { id: string }).id}`, { cache: 'no-store' })
-        const contentData = await contentRes.json()
-        const raw: string = contentData.artifact?.content ?? ''
-        const cleaned = raw.replace(/^\s*\d+\s*\|\s?/gm, '')
-        const parsed = JSON.parse(cleaned)
-        const name = parsed?.company_profile?.company_name || parsed?.company_name
+        if (!pb) return
+        const r = await fetch(`/api/sdr/pipeline/artifact?task_id=${pb.id}&artifact_name=profile_documents`)
+        const { content } = await r.json() as { content: Record<string, unknown> | null }
+        const name = (content?.company_profile as Record<string, unknown>)?.company_name
+          ?? (content as Record<string, unknown>)?.company_name
         if (name) setCompanyName(String(name))
-      } catch {}
-    }
-    fetchCompanyName()
+      })
+      .catch(() => {})
   }, [])
 
-  // On mount: detect active tasks and load leads from latest completed run
-  useEffect(() => {
-    checkActiveTasks()
-    loadLeads(true)
-  }, [checkActiveTasks, loadLeads])
+  const updateStage = useCallback((key: StageKey, patch: Partial<StageState>) => {
+    setStages(prev => {
+      const next = { ...prev, [key]: { ...prev[key], ...patch } }
+      saveLS(next, config)
+      return next
+    })
+  }, [config])
 
-  // Poll the active task every 3s; when it completes, clear it and reload leads
-  useEffect(() => {
-    if (!activePipelineTaskId) {
-      if (activeTaskPollRef.current) {
-        clearInterval(activeTaskPollRef.current)
-        activeTaskPollRef.current = null
-      }
-      return
-    }
-    activeTaskPollRef.current = setInterval(async () => {
+  // Poll a running stage task until completion, then fetch artifact
+  const pollStage = useCallback((key: StageKey, taskId: string, artifactName: string) => {
+    const ref = setInterval(async () => {
       try {
-        const res = await fetch('/api/tasks', { cache: 'no-store' })
-        const data = await res.json()
-        const task = (data.tasks ?? []).find(
-          (t: { id: string; status: string }) => t.id === activePipelineTaskId
-        )
-        if (task && !ACTIVE_STATUSES.has(task.status)) {
-          setActivePipelineTaskId(null)
-          loadLeads(true)
+        const r = await fetch(`/api/tasks`, { cache: 'no-store' })
+        const d = await r.json() as { tasks: Array<{ id: string; name: string; status: string }> }
+        const task = (d.tasks ?? []).find(t => t.id === taskId)
+        if (!task) {
+          clearInterval(ref)
+          delete pollRefs.current[key]
+          updateStage(key, { status: 'failed', error: 'Task not found (deleted or expired)' })
+          return
+        }
+
+        const done = !['open', 'running', 'pending', 'in_progress'].includes(task.status)
+        if (!done) return
+
+        clearInterval(ref)
+        delete pollRefs.current[key]
+
+        if (task.status === 'completed' || task.status === 'open') {
+          // Fetch the artifact
+          const ar = await fetch(`/api/sdr/pipeline/artifact?task_id=${taskId}&artifact_name=${artifactName}`)
+          const { content } = await ar.json() as { content: Record<string, unknown> | null }
+          if (content) {
+            updateStage(key, { status: 'completed', artifact: content })
+          } else {
+            updateStage(key, { status: 'failed', error: 'No artifact produced' })
+          }
+        } else {
+          updateStage(key, { status: 'failed', error: `Task ${task.status}` })
         }
       } catch {}
-    }, 3000)
-    return () => {
-      if (activeTaskPollRef.current) {
-        clearInterval(activeTaskPollRef.current)
-        activeTaskPollRef.current = null
-      }
-    }
-  }, [activePipelineTaskId, loadLeads])
+    }, 4000)
+    pollRefs.current[key] = ref
+  }, [updateStage])
 
-  // Reload when the tab regains focus (user returns from console)
+  // Re-attach polls for any stages that were running when page was left
   useEffect(() => {
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        checkActiveTasks()
-        loadLeads(true)
+    for (const meta of STAGE_META) {
+      const s = stages[meta.key]
+      if (s.status === 'running' && s.taskId) {
+        pollStage(meta.key, s.taskId, meta.artifact)
       }
     }
-    document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
-  }, [checkActiveTasks, loadLeads])
+    return () => { Object.values(pollRefs.current).forEach(clearInterval) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  function toggleSelect(id: string) {
-    setSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
+  async function runStage(key: StageKey) {
+    const meta = STAGE_META.find(m => m.key === key)!
+    updateStage(key, { status: 'running', error: null, startedAt: new Date().toISOString() })
+
+    try {
+      const body: Record<string, unknown> = {
+        stage: key,
+        dry_run:           !config.clayApiKey || config.dryRun,
+        clay_api_key:      config.clayApiKey || undefined,
+        max_leads:         config.maxLeads,
+        scoring_threshold: config.scoringThreshold,
+      }
+      // Pass previous stage task IDs so the route can fetch prior outputs
+      const idx = STAGE_ORDER.indexOf(key)
+      if (idx >= 1) body.lead_researcher_task_id   = stages.lead_researcher.taskId   ?? undefined
+      if (idx >= 2) body.lead_scorer_task_id        = stages.lead_scorer.taskId       ?? undefined
+      if (idx >= 3) body.deep_researcher_task_id    = stages.deep_researcher.taskId   ?? undefined
+      if (idx >= 4) body.outreach_designer_task_id  = stages.outreach_designer.taskId ?? undefined
+      if (idx >= 5) body.email_composer_task_id     = stages.email_composer.taskId    ?? undefined
+
+      const res  = await fetch('/api/sdr/pipeline/stage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const data = await res.json() as { taskId?: string; error?: string }
+
+      if (!res.ok || data.error) {
+        updateStage(key, { status: 'failed', error: data.error ?? 'Failed to start' })
+        return
+      }
+
+      const taskId = data.taskId ?? null
+      updateStage(key, { taskId })
+
+      if (taskId) {
+        pollStage(key, taskId, meta.artifact)
+      } else {
+        updateStage(key, { status: 'failed', error: 'No task ID returned' })
+      }
+    } catch (err) {
+      updateStage(key, { status: 'failed', error: err instanceof Error ? err.message : 'Network error' })
+    }
+  }
+
+  function rerunStage(key: StageKey) {
+    // Clear this stage and all stages after it
+    const idx = STAGE_ORDER.indexOf(key)
+    setStages(prev => {
+      const next = { ...prev }
+      for (let i = idx; i < STAGE_ORDER.length; i++) {
+        next[STAGE_ORDER[i]] = { ...EMPTY_STAGE }
+      }
+      saveLS(next, config)
       return next
     })
   }
 
-  async function runProspecting() {
-    setRunState('loading')
-    setRunError(null)
-    try {
-      const res = await fetch('/api/flow/sales-pipeline/run', { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) {
-        setRunState('error')
-        setRunError(data.error ?? 'Failed to start pipeline')
-        return
-      }
-      router.push('/console')
-    } catch (err) {
-      setRunState('error')
-      setRunError(err instanceof Error ? err.message : 'Network error')
-    }
+  function resetAll() {
+    const fresh = initialStages()
+    setStages(fresh)
+    saveLS(fresh, config)
   }
 
-  const filteredLeads = leads.filter(l => {
-    if (filterGrade !== 'all' && l.grade !== filterGrade) return false
-    if (filterPassed === 'passed' && !l.passed_threshold) return false
-    if (filterPassed === 'failed' && l.passed_threshold) return false
-    return true
-  })
+  function canRunStage(key: StageKey): boolean {
+    const idx = STAGE_ORDER.indexOf(key)
+    if (idx === 0) return true
+    return stages[STAGE_ORDER[idx - 1]].status === 'completed'
+  }
 
-  const selCount = selected.size
-  const isPipelineRunning = activePipelineTaskId !== null
+  const completedCount = STAGE_META.filter(m => stages[m.key].status === 'completed').length
+  const runningCount   = STAGE_META.filter(m => stages[m.key].status === 'running').length
+  const hasAny = completedCount > 0 || runningCount > 0
 
   return (
-    <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
-
-      {/* Running banner */}
-      {isPipelineRunning && (
-        <div style={{
-          padding: '9px 32px',
-          background: 'var(--info-soft)',
-          borderBottom: '1px solid var(--info)',
-          display: 'flex', alignItems: 'center', gap: '10px',
-          flexShrink: 0,
-        }}>
-          <Loader2 size={13} color="var(--info)" style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
-          <span style={{ fontSize: '12.5px', color: 'var(--info)', fontWeight: 500 }}>
-            Prospecting pipeline is running — leads will appear here when complete
-          </span>
-          <button
-            onClick={() => router.push('/console')}
-            style={{
-              display: 'inline-flex', alignItems: 'center', gap: '5px',
-              fontSize: '11.5px', fontWeight: 500, color: 'var(--info)',
-              background: 'transparent', border: '1px solid var(--info)',
-              borderRadius: '4px', padding: '3px 10px', cursor: 'pointer',
-            }}
-          >
-            <Terminal size={10} />
-            View in console
-          </button>
-          <div style={{ flex: 1 }} />
-          <span style={{ fontSize: '10.5px', color: 'var(--info)', opacity: 0.6, fontFamily: "'JetBrains Mono', monospace" }}>
-            {activePipelineTaskId}
-          </span>
-        </div>
-      )}
+    <div style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+      <style>{`@keyframes spin { from { transform:rotate(0deg) } to { transform:rotate(360deg) } }`}</style>
 
       {/* Header */}
-      <div style={{
-        padding: '28px 32px 16px',
-        borderBottom: '1px solid var(--line)',
-        display: 'flex', alignItems: 'flex-end', gap: '24px', flexShrink: 0,
-      }}>
-        <div>
-          <h1 style={{ fontFamily: "'Instrument Serif', serif", fontSize: '32px', letterSpacing: '-0.01em', color: 'var(--ink)', lineHeight: 1 }}>
-            Account Pipeline
-          </h1>
-          <div style={{ fontSize: '13px', color: 'var(--ink-3)', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            {companyName} · ICP v1
-            {dataSource && (
-              <span style={{ fontSize: '11px', background: 'var(--good-soft)', color: 'var(--good)', padding: '1px 7px', borderRadius: '10px', fontWeight: 500 }}>
-                Live · {dataSource}
-              </span>
-            )}
+      <div style={{ padding: '28px 32px 20px', borderBottom: '1px solid var(--line)', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 24 }}>
+          <div>
+            <h1 style={{ fontFamily: "'Instrument Serif',serif", fontSize: 30, letterSpacing: '-0.01em', color: 'var(--ink)', lineHeight: 1, margin: 0 }}>
+              Lead Pipeline
+            </h1>
+            <div style={{ fontSize: 13, color: 'var(--ink-3)', marginTop: 4 }}>
+              {companyName} · Run stages one by one · Review before proceeding
+            </div>
           </div>
-        </div>
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' }}>
-          {runError && (
-            <span style={{ fontSize: '11.5px', color: 'var(--bad)', display: 'flex', alignItems: 'center', gap: '5px' }}>
-              <AlertCircle size={12} />
-              {runError}
-            </span>
+
+          {/* Progress */}
+          {hasAny && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+              {STAGE_META.map((m, i) => {
+                const s = stages[m.key].status
+                const bg = s === 'completed' ? 'var(--good)' : s === 'running' ? 'var(--accent)' : s === 'failed' ? 'var(--bad)' : 'var(--line)'
+                return <div key={m.key} style={{ width: 28, height: 5, borderRadius: 3, background: bg, transition: 'background 0.3s' }} title={`${i+1}. ${m.label}: ${s}`} />
+              })}
+              <span style={{ fontSize: 11.5, color: 'var(--ink-4)', marginLeft: 4 }}>{completedCount}/6 done</span>
+            </div>
           )}
-          {/* View toggle */}
-          <div style={{ display: 'flex', border: '1px solid var(--line)', borderRadius: '5px', overflow: 'hidden' }}>
-            {([
-              { key: 'kanban', icon: <LayoutGrid size={12} />, label: 'Kanban' },
-              { key: 'list',   icon: <LayoutList size={12} />, label: 'List'   },
-            ] as const).map(({ key, icon, label }) => (
-              <button key={key} onClick={() => setViewMode(key)} style={{
-                display: 'flex', alignItems: 'center', gap: '5px',
-                padding: '6px 11px', fontSize: '11.5px', fontWeight: viewMode === key ? 600 : 400,
-                background: viewMode === key ? 'var(--ink)' : 'var(--paper)',
-                color: viewMode === key ? 'white' : 'var(--ink-3)',
-                cursor: 'pointer', borderRight: key === 'kanban' ? '1px solid var(--line)' : 'none',
-              }}>
-                {icon} {label}
+
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+            {hasAny && (
+              <button onClick={resetAll} style={{ fontSize: 12, color: 'var(--ink-3)', background: 'var(--paper)', border: '1px solid var(--line)', borderRadius: 5, padding: '6px 12px', cursor: 'pointer' }}>
+                New Run
               </button>
-            ))}
-          </div>
-          <button
-            onClick={() => loadLeads(true)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: '6px',
-              padding: '7px 12px', fontSize: '12px',
-              background: 'var(--paper)', border: '1px solid var(--line)',
-              borderRadius: '5px', color: 'var(--ink-2)', cursor: 'pointer',
-            }}
-          >
-            <RefreshCw size={11} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
-          </button>
-          <button style={{
-            display: 'flex', alignItems: 'center', gap: '6px',
-            padding: '7px 14px', fontSize: '12.5px',
-            background: 'var(--paper)', border: '1px solid var(--line)',
-            borderRadius: '5px', color: 'var(--ink-2)', cursor: 'pointer', fontWeight: 500,
-          }}>
-            <Plus size={12} />
-            New account
-          </button>
-
-          {isPipelineRunning ? (
+            )}
             <button
-              onClick={() => router.push('/console')}
-              style={{
-                display: 'flex', alignItems: 'center', gap: '6px',
-                padding: '7px 14px', fontSize: '12.5px',
-                background: 'var(--info-soft)',
-                border: '1px solid var(--info)',
-                borderRadius: '5px', color: 'var(--info)', cursor: 'pointer',
-                fontWeight: 500,
-              }}
+              onClick={() => setShowConfig(c => !c)}
+              style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: showConfig ? 'var(--accent)' : 'var(--ink-3)', background: showConfig ? 'var(--accent-tint)' : 'var(--paper)', border: `1px solid ${showConfig ? 'var(--accent)' : 'var(--line)'}`, borderRadius: 5, padding: '6px 12px', cursor: 'pointer' }}
             >
-              <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
-              Running · console
-            </button>
-          ) : (
-            <button
-              onClick={runProspecting}
-              disabled={runState === 'loading'}
-              style={{
-                display: 'flex', alignItems: 'center', gap: '6px',
-                padding: '7px 14px', fontSize: '12.5px',
-                background: runState === 'loading' ? 'var(--ink-2)' : 'var(--accent)',
-                border: `1px solid ${runState === 'loading' ? 'var(--ink-2)' : 'var(--accent)'}`,
-                borderRadius: '5px', color: 'white', cursor: runState === 'loading' ? 'default' : 'pointer',
-                fontWeight: 500, opacity: runState === 'loading' ? 0.8 : 1,
-              }}
-            >
-              {runState === 'loading' ? (
-                <>
-                  <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
-                  Starting…
-                </>
-              ) : (
-                <>
-                  <Zap size={12} />
-                  Run prospecting
-                </>
-              )}
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Chat bar */}
-      <div style={{
-        padding: '10px 32px', borderBottom: '1px solid var(--line)',
-        background: 'var(--paper-2)', flexShrink: 0,
-      }}>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: '10px',
-          background: 'var(--paper)', border: '1px solid var(--line)',
-          borderRadius: '6px', padding: '8px 12px',
-        }}>
-          <input
-            style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', fontSize: '13px', color: 'var(--ink)' }}
-            placeholder="Find accounts, filter by trigger, or ask about pipeline health…"
-            readOnly
-          />
-          <button style={{ padding: '4px 10px', fontSize: '11.5px', fontWeight: 500, background: 'var(--ink)', color: 'var(--paper)', borderRadius: '4px', cursor: 'pointer' }}>
-            Ask
-          </button>
-        </div>
-      </div>
-
-      {/* Filter bar */}
-      <div style={{
-        padding: '8px 32px', borderBottom: '1px solid var(--line)',
-        display: 'flex', alignItems: 'center', gap: '16px', flexShrink: 0, flexWrap: 'wrap',
-        background: 'var(--paper-2)',
-      }}>
-        {/* Grade filter */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ fontSize: '11px', color: 'var(--ink-4)', fontWeight: 600 }}>GRADE</span>
-          {(['all', 'A', 'B', 'C'] as const).map(g => (
-            <button key={g} onClick={() => setFilterGrade(g)} style={{
-              padding: '3px 9px', fontSize: '11px', fontWeight: filterGrade === g ? 600 : 400,
-              background: filterGrade === g ? 'var(--ink)' : 'var(--paper)',
-              color: filterGrade === g ? 'white' : 'var(--ink-3)',
-              border: `1px solid ${filterGrade === g ? 'var(--ink)' : 'var(--line)'}`,
-              borderRadius: '4px', cursor: 'pointer',
-            }}>
-              {g === 'all' ? 'All' : g}
-            </button>
-          ))}
-        </div>
-
-        <div style={{ width: '1px', height: '18px', background: 'var(--line)' }} />
-
-        {/* Passed filter */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ fontSize: '11px', color: 'var(--ink-4)', fontWeight: 600 }}>STATUS</span>
-          {([
-            { key: 'all', label: 'All' },
-            { key: 'passed', label: '✓ Passed' },
-            { key: 'failed', label: '✗ Below threshold' },
-          ] as const).map(({ key, label }) => (
-            <button key={key} onClick={() => setFilterPassed(key)} style={{
-              padding: '3px 9px', fontSize: '11px', fontWeight: filterPassed === key ? 600 : 400,
-              background: filterPassed === key ? 'var(--ink)' : 'var(--paper)',
-              color: filterPassed === key ? 'white' : 'var(--ink-3)',
-              border: `1px solid ${filterPassed === key ? 'var(--ink)' : 'var(--line)'}`,
-              borderRadius: '4px', cursor: 'pointer',
-            }}>
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {(filterGrade !== 'all' || filterPassed !== 'all') && (
-          <button onClick={() => { setFilterGrade('all'); setFilterPassed('all') }} style={{
-            display: 'flex', alignItems: 'center', gap: '4px',
-            fontSize: '11px', color: 'var(--ink-4)', cursor: 'pointer',
-            background: 'none', border: 'none', padding: '3px 6px',
-          }}>
-            <X size={10} /> Clear
-          </button>
-        )}
-
-        <div style={{ marginLeft: 'auto', fontSize: '11.5px', color: 'var(--ink-4)' }}>
-          {filteredLeads.length !== leads.length
-            ? <><strong style={{ color: 'var(--ink-2)' }}>{filteredLeads.length}</strong> of {leads.length} accounts</>
-            : <>{leads.length} accounts</>
-          }
-          {dataSource
-            ? <span style={{ marginLeft: '8px', fontSize: '11px', background: 'var(--good-soft)', color: 'var(--good)', padding: '1px 7px', borderRadius: '10px', fontWeight: 500 }}>Live</span>
-            : <span style={{ marginLeft: '8px', fontSize: '11px', color: 'var(--ink-4)' }}>· sample data</span>
-          }
-        </div>
-      </div>
-
-      {/* Bulk action bar */}
-      {selCount > 0 && (
-        <div style={{
-          position: 'fixed', top: '44px', left: '220px', right: 0,
-          background: 'var(--ink)', color: 'var(--paper)',
-          padding: '10px 32px', display: 'flex', alignItems: 'center', gap: '12px',
-          zIndex: 50, flexShrink: 0,
-        }}>
-          <span style={{ fontSize: '12.5px', fontWeight: 500 }}>{selCount} selected</span>
-          <div style={{ width: '1px', height: '16px', background: 'rgba(255,255,255,0.2)' }} />
-          {['Promote to Shortlisted', 'Suppress'].map(label => (
-            <button key={label} style={{
-              padding: '5px 12px', fontSize: '12px',
-              background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)',
-              borderRadius: '4px', color: 'var(--paper)', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', gap: '5px',
-            }}>
-              <ChevronRight size={11} />
-              {label}
-            </button>
-          ))}
-          <button
-            onClick={() => router.push('/engagement')}
-            style={{
-              padding: '5px 12px', fontSize: '12px',
-              background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)',
-              borderRadius: '4px', color: 'var(--paper)', cursor: 'pointer',
-              display: 'flex', alignItems: 'center', gap: '5px',
-            }}
-          >
-            <ChevronRight size={11} />
-            Enroll in sequence
-          </button>
-          <div style={{ marginLeft: 'auto' }}>
-            <button onClick={() => setSelected(new Set())} style={{ padding: '5px', color: 'rgba(255,255,255,0.6)', cursor: 'pointer', display: 'flex' }}>
-              <X size={16} />
+              <Settings size={12} /> Config
             </button>
           </div>
         </div>
-      )}
 
-      {/* Kanban board */}
-      {viewMode === 'kanban' && (
-        <div style={{ flex: 1, overflowX: 'auto', overflowY: 'hidden', padding: '16px 24px' }}>
-          <div style={{ display: 'flex', gap: '12px', height: '100%', minWidth: 'max-content' }}>
-            {columns.map(col => {
-              const colLeads = filteredLeads.filter(l => l.column === col.key)
-              return (
-                <div key={col.key} style={{ width: '240px', flexShrink: 0, display: 'flex', flexDirection: 'column', height: '100%' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '0 4px 10px', flexShrink: 0 }}>
-                    <span style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--ink-3)' }}>
-                      {col.label}
-                    </span>
-                    <span style={{
-                      fontSize: '10px', fontWeight: 600,
-                      background: 'var(--paper-2)', color: 'var(--ink-4)',
-                      padding: '0 6px', borderRadius: '10px', lineHeight: '16px',
-                      border: '1px solid var(--line)',
-                    }}>
-                      {colLeads.length}
-                    </span>
-                  </div>
-                  <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px', paddingRight: '2px' }}>
-                    {colLeads.map(lead => (
-                      <KanbanCard key={lead.id} lead={lead} selected={selected.has(lead.id)} onToggle={toggleSelect} />
-                    ))}
-                    {colLeads.length === 0 && (
-                      <div style={{
-                        border: '1px dashed var(--line)', borderRadius: '5px',
-                        padding: '16px 12px', textAlign: 'center',
-                        fontSize: '11px', color: 'var(--ink-4)',
-                      }}>
-                        {isPipelineRunning && col.key === 'researched' ? 'Finding leads…' : 'No accounts'}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* List / Table view */}
-      {viewMode === 'list' && (
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12.5px' }}>
-            <thead>
-              <tr style={{ borderBottom: '2px solid var(--line)', background: 'var(--paper-2)', position: 'sticky', top: 0, zIndex: 2 }}>
-                <th style={{ padding: '8px 10px', width: '28px' }} />
-                {['Company', 'Score', 'Threshold', 'ICP Match', 'Signals', 'Rationale'].map(h => (
-                  <th key={h} style={{ padding: '8px 10px', textAlign: 'left', fontSize: '10px', fontWeight: 700, color: 'var(--ink-4)', letterSpacing: '0.07em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>
-                    {h}
-                  </th>
+        {/* Config panel */}
+        {showConfig && (
+          <div style={{ marginTop: 16, padding: '14px 16px', background: 'var(--paper-2)', borderRadius: 8, border: '1px solid var(--line)', display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            {/* Mode toggle */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Data Source</label>
+              <div style={{ display: 'flex', border: '1px solid var(--line)', borderRadius: 5, overflow: 'hidden' }}>
+                {[
+                  { val: true,  label: 'Synthetic (dry run)' },
+                  { val: false, label: 'Clay API (real leads)' },
+                ].map(opt => (
+                  <button key={String(opt.val)} onClick={() => setConfig(c => ({ ...c, dryRun: opt.val }))}
+                    style={{ padding: '6px 12px', fontSize: 12, fontWeight: config.dryRun === opt.val ? 600 : 400, background: config.dryRun === opt.val ? 'var(--ink)' : 'var(--paper)', color: config.dryRun === opt.val ? 'white' : 'var(--ink-3)', cursor: 'pointer', borderRight: opt.val ? '1px solid var(--line)' : 'none' }}>
+                    {opt.label}
+                  </button>
                 ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filteredLeads.length === 0 ? (
-                <tr>
-                  <td colSpan={7} style={{ padding: '40px', textAlign: 'center', color: 'var(--ink-4)', fontSize: '13px' }}>
-                    {isPipelineRunning ? 'Pipeline running — leads will appear here shortly…' : 'No accounts match the current filters'}
-                  </td>
-                </tr>
-              ) : (
-                filteredLeads.map(lead => (
-                  <LeadTableRow key={lead.id} lead={lead} selected={selected.has(lead.id)} onToggle={toggleSelect} />
-                ))
-              )}
-            </tbody>
-          </table>
+              </div>
+            </div>
+
+            {/* Clay API key */}
+            {!config.dryRun && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <Key size={10} /> Clay API Key
+                </label>
+                <input
+                  type="password"
+                  placeholder="clay_live_..."
+                  value={config.clayApiKey}
+                  onChange={e => setConfig(c => ({ ...c, clayApiKey: e.target.value }))}
+                  style={{ width: 220, padding: '6px 10px', border: '1px solid var(--line)', borderRadius: 5, fontSize: 12, fontFamily: 'monospace', background: 'white' }}
+                />
+              </div>
+            )}
+
+            {/* Max leads */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Max Leads</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="range" min={5} max={50} step={5} value={config.maxLeads}
+                  onChange={e => setConfig(c => ({ ...c, maxLeads: Number(e.target.value) }))}
+                  style={{ width: 100 }} />
+                <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)', minWidth: 24 }}>{config.maxLeads}</span>
+              </div>
+            </div>
+
+            {/* Scoring threshold */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Score Threshold</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="range" min={0.5} max={0.95} step={0.05} value={config.scoringThreshold}
+                  onChange={e => setConfig(c => ({ ...c, scoringThreshold: Number(e.target.value) }))}
+                  style={{ width: 100 }} />
+                <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)', minWidth: 36 }}>{Math.round(config.scoringThreshold * 100)}%</span>
+              </div>
+            </div>
+
+            <button onClick={() => { saveLS(stages, config); setShowConfig(false) }}
+              style={{ fontSize: 12, fontWeight: 600, color: 'white', background: 'var(--accent)', border: 'none', borderRadius: 5, padding: '7px 16px', cursor: 'pointer' }}>
+              Save
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Stage list */}
+      <div style={{ flex: 1, padding: '24px 32px', display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 900 }}>
+        {STAGE_META.map((meta, i) => (
+          <StageCard
+            key={meta.key}
+            meta={meta}
+            state={stages[meta.key]}
+            index={i}
+            canRun={canRunStage(meta.key)}
+            onRun={() => runStage(meta.key)}
+            onRerun={() => rerunStage(meta.key)}
+          />
+        ))}
+
+        {/* CLI hint */}
+        <div style={{ marginTop: 8, padding: '10px 14px', background: 'var(--paper-2)', borderRadius: 6, fontSize: 11.5, color: 'var(--ink-4)', fontFamily: 'monospace', lineHeight: 1.7 }}>
+          CLI: <span style={{ color: 'var(--ink-2)' }}>swarm38 task run --flow-id sdr:core:pipeline-stage --registry ./swarm-registry/swarm-registry --input-json {'\'{"stage":"lead_researcher",...}\''}</span>
         </div>
-      )}
+      </div>
     </div>
   )
 }

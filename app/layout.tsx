@@ -22,6 +22,11 @@ import {
   Code2,
   Megaphone,
   ChevronRight,
+  Activity,
+  FileText,
+  Pencil,
+  Settings,
+  GitMerge,
 } from 'lucide-react'
 
 interface NavItem {
@@ -36,7 +41,7 @@ interface NavGroup {
   items: NavItem[]
 }
 
-const navGroups: NavGroup[] = [
+const sdrNavGroups: NavGroup[] = [
   {
     label: 'Work',
     items: [
@@ -63,8 +68,27 @@ const navGroups: NavGroup[] = [
     label: 'Authoring',
     items: [
       { label: 'Flow Graph', href: '/flows', icon: <GitBranch size={13} /> },
+      { label: 'SDR × CMD', href: '/sample', icon: <GitMerge size={13} /> },
       { label: 'Connectors', href: '/connectors', icon: <Plug size={13} /> },
       { label: 'Profile Builder', href: '/setup', icon: <Brain size={13} /> },
+    ],
+  },
+]
+
+const cmdNavGroups: NavGroup[] = [
+  {
+    label: 'Monitor',
+    items: [
+      { label: 'Studio', href: '/cmd/studio', icon: <Activity size={13} /> },
+      { label: 'Content', href: '/cmd/content', icon: <FileText size={13} /> },
+      { label: 'Flow Graph', href: '/cmd/flow', icon: <GitBranch size={13} /> },
+    ],
+  },
+  {
+    label: 'Configure',
+    items: [
+      { label: 'Prompts', href: '/cmd/prompts', icon: <Pencil size={13} /> },
+      { label: 'Setup', href: '/cmd/setup', icon: <Settings size={13} /> },
     ],
   },
 ]
@@ -122,6 +146,7 @@ function TopBar() {
   const packsRef = useRef<HTMLDivElement>(null)
 
   const isBrainActive = pathname === '/brain' || pathname.startsWith('/brain/')
+  const isCmdActive   = pathname.startsWith('/cmd')
 
   useEffect(() => {
     if (!packsOpen) return
@@ -221,7 +246,7 @@ function TopBar() {
             <Package size={13} strokeWidth={1.6} />
             Packs
             <span style={{ fontSize: '11px', padding: '1px 6px', background: packsOpen ? 'rgba(255,255,255,0.2)' : 'var(--ink)', color: packsOpen ? 'var(--paper)' : 'var(--paper)', borderRadius: '3px', fontWeight: 600, letterSpacing: '0.05em' }}>
-              SDR
+              {isCmdActive ? 'CMD' : 'SDR'}
             </span>
           </div>
 
@@ -252,6 +277,9 @@ function TopBar() {
                     if (pack.id === 'sdr') {
                       setPacksOpen(false)
                       router.push('/')
+                    } else if (pack.id === 'content') {
+                      setPacksOpen(false)
+                      router.push('/cmd/studio')
                     }
                   }}
                   style={{
@@ -260,8 +288,8 @@ function TopBar() {
                     gap: '12px',
                     padding: '10px 14px',
                     borderRadius: '5px',
-                    background: pack.active ? 'var(--paper-2)' : 'transparent',
-                    cursor: pack.id === 'sdr' ? 'pointer' : 'default',
+                    background: (pack.id === 'sdr' && !isCmdActive) || (pack.id === 'content' && isCmdActive) ? 'var(--paper-2)' : 'transparent',
+                    cursor: pack.id === 'sdr' || pack.id === 'content' ? 'pointer' : 'default',
                     margin: '0 6px',
                   }}
                 >
@@ -425,6 +453,9 @@ function TopBar() {
 }
 
 function LeftRail({ pathname }: { pathname: string }) {
+  const isCmd = pathname.startsWith('/cmd')
+  const navGroups = isCmd ? cmdNavGroups : sdrNavGroups
+
   return (
     <div style={{
       width: '220px',
@@ -444,16 +475,16 @@ function LeftRail({ pathname }: { pathname: string }) {
       }}>
         <div style={{
           width: '24px', height: '24px',
-          background: 'var(--accent)',
+          background: isCmd ? 'var(--info)' : 'var(--accent)',
           borderRadius: '6px',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           flexShrink: 0,
         }}>
-          <Target size={12} color="white" strokeWidth={2} />
+          {isCmd ? <Megaphone size={12} color="white" strokeWidth={2} /> : <Target size={12} color="white" strokeWidth={2} />}
         </div>
         <div>
-          <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--ink)' }}>SDR</div>
-          <div style={{ fontSize: '10px', color: 'var(--ink-4)' }}>Sales Pack</div>
+          <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--ink)' }}>{isCmd ? 'CMD' : 'SDR'}</div>
+          <div style={{ fontSize: '10px', color: 'var(--ink-4)' }}>{isCmd ? 'Content Pack' : 'Sales Pack'}</div>
         </div>
       </div>
 

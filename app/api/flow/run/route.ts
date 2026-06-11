@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { exec } from 'child_process'
-import { promisify } from 'util'
+import { spawn } from 'child_process'
 
-const execAsync = promisify(exec)
-
-const REGISTRY = '/home/shanks/Videos/swarmstudio-cli-1.1.0-linux-amd64/swarm-registry/swarm-registry'
-const FLOW_ID = 'sdr:core:profile-builder'
+const SWARM_BASE = process.env.SWARM_API_URL ?? 'http://localhost:8080'
+const REGISTRY   = process.env.SWARM_REGISTRY ?? '/home/shanks/Videos/swarmstudio-cli-1.1.0-linux-amd64/swarm-registry/swarm-registry'
+const FLOW_ID    = 'sdr:core:profile-builder'
 const WORKSPACE_ID = 'ws-09Dymwpl'
 
 export async function POST(req: NextRequest) {
@@ -24,32 +22,49 @@ export async function POST(req: NextRequest) {
       initial_company_text: companyText,
     })
 
-    // Run the CLI — this is what actually loads and executes the swarm agents
-    const cmd = `swarm task run --flow-id ${FLOW_ID} --registry ${REGISTRY} --input-json '${inputJson.replace(/'/g, "'\\''")}'`
+    // Spawn swarm38 task run detached — same pattern as cmd:core:content-pipeline
+    const proc = spawn(
+      'swarm38',
+      ['task', 'run', '--flow-id', FLOW_ID, '--registry', REGISTRY, '--input-json', inputJson],
+      {
+        detached: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        env: { ...process.env, HOME: '/home/shanks' },
+      }
+    )
+    proc.stdin!.write('\n')
+    proc.stdin!.end()
+    proc.unref()
 
-    // Fire and forget — CLI blocks for 8-10 min, frontend polls independently
-    exec(cmd, { timeout: 15 * 60 * 1000 }, (err) => {
-      if (err) console.error('[flow/run] CLI exited with error:', err.message)
-      else console.log('[flow/run] CLI completed successfully')
-    })
+    // Wait for the task to be registered
+    await new Promise(r => setTimeout(r, 2500))
 
-    // Give the CLI ~1.5s to create the task record before we try to read it
-    await new Promise(r => setTimeout(r, 1500))
-
-    // Fetch the most recently created task for this flow to return its ID
-    const res = await fetch('http://localhost:8080/api/tasks', { cache: 'no-store' })
+    // Fetch the newly created task
+    const res = await fetch(`${SWARM_BASE}/api/tasks`, { cache: 'no-store' })
     const data = await res.json()
-    const tasks: Array<{ id: string; name: string; status: string; created_at: string; kind: string }> =
-      Array.isArray(data.result) ? data.result : []
+    const tasks: Array<{ id: string; name: string; status: string; created_at: string }> =
+      Array.isArray(data.result) ? data.result : (data.result?.tasks ?? [])
 
     const latest = tasks
-      .filter(t => t.name === FLOW_ID && t.kind === 'task')
+      .filter(t => t.name === FLOW_ID)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+
+    // Resolve flow session ID
+    let flowSessionId: string | null = null
+    if (latest?.id) {
+      try {
+        const fsRes = await fetch(`${SWARM_BASE}/api/flow-session-id/${latest.id}`, { cache: 'no-store' })
+        if (fsRes.ok) {
+          const fsData = await fsRes.json() as { flow_session_id?: string }
+          flowSessionId = fsData.flow_session_id ?? null
+        }
+      } catch {}
+    }
 
     return NextResponse.json({
       taskId: latest?.id ?? null,
-      flowSessionId: null,
-      message: 'Pipeline started via CLI',
+      flowSessionId,
+      message: 'Profile Builder started',
     })
   } catch (err) {
     console.error('[flow/run] error:', err)

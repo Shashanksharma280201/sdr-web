@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server'
-import { exec } from 'child_process'
+import { spawn } from 'child_process'
 
-const SWARM_BASE = 'http://localhost:8080'
-const REGISTRY = '/home/shanks/Videos/swarmstudio-cli-1.1.0-linux-amd64/swarm-registry/swarm-registry'
-const FLOW_ID = 'sdr:core:sales-pipeline'
+const SWARM_BASE = process.env.SWARM_API_URL ?? 'http://localhost:8080'
+const REGISTRY   = process.env.SWARM_REGISTRY ?? '/home/shanks/Videos/swarmstudio-cli-1.1.0-linux-amd64/swarm-registry/swarm-registry'
+const FLOW_ID    = 'sdr:core:sales-pipeline'
 const WORKSPACE_ID = 'ws-09Dymwpl'
 
 function parseContent(raw: string | null | undefined): Record<string, unknown> | null {
@@ -26,7 +26,6 @@ async function swarmGet<T>(path: string): Promise<T> {
 export async function POST() {
   try {
     // Find newest completed profile-builder task that has a profile_documents artifact.
-    // Skip tasks where the pipeline completed but didn't save all artifacts.
     const tasks = await swarmGet<Array<{ id: string; name: string; status: string; created_at: string }>>(
       '/api/tasks'
     )
@@ -41,6 +40,7 @@ export async function POST() {
       )
     }
 
+    // Find the candidate that has profile_documents
     let arts: Array<{ id: string; entry_name: string }> = []
     let pbTask = pbTasks[0]
     for (const candidate of pbTasks) {
@@ -61,7 +61,7 @@ export async function POST() {
 
     if (!pdArt) {
       return NextResponse.json(
-        { error: 'No profile-builder run has a complete profile_documents artifact. Please re-run Profile Builder from the Setup page.' },
+        { error: 'profile_documents artifact not found. Please re-run Profile Builder from the Setup page.' },
         { status: 400 }
       )
     }
@@ -72,29 +72,28 @@ export async function POST() {
 
     if (!pdData?.icp_profile || !pdData?.buyer_persona || !pdData?.company_profile) {
       return NextResponse.json(
-        { error: 'profile_documents is missing required fields. Please re-run Profile Builder.' },
+        { error: 'profile_documents is missing required fields (icp_profile / buyer_persona / company_profile). Please re-run Profile Builder.' },
         { status: 400 }
       )
     }
 
-    // Fetch scoring_rubric — standalone artifact preferred, fallback to embedded in profile_documents
+    // Fetch scoring_rubric — standalone artifact preferred, fallback to embedded
     let scoringRubric: Record<string, unknown> | null = null
     if (srArt) {
       const srFull = await swarmGet<{ content?: string }>(`/api/artifacts/${srArt.id}`)
       scoringRubric = parseContent(srFull.content)
     }
-    if (!scoringRubric && pdData?.scoring_rubric && typeof pdData.scoring_rubric === 'object') {
+    if (!scoringRubric && typeof pdData.scoring_rubric === 'object' && pdData.scoring_rubric) {
       scoringRubric = pdData.scoring_rubric as Record<string, unknown>
     }
 
-    // Fetch icp_data if available (used for richer lead scoring context)
+    // Fetch icp_data if available
     let icpData: Record<string, unknown> | null = null
     if (icpArt) {
       const icpFull = await swarmGet<{ content?: string }>(`/api/artifacts/${icpArt.id}`)
       icpData = parseContent(icpFull.content)
     }
 
-    // Build CLI input
     const inputJson = JSON.stringify({
       org_id: WORKSPACE_ID,
       workspace_id: WORKSPACE_ID,
@@ -108,29 +107,48 @@ export async function POST() {
       dry_run: true,
     })
 
-    const cmd = `swarm task run --flow-id ${FLOW_ID} --registry ${REGISTRY} --input-json '${inputJson.replace(/'/g, "'\\''")}'`
+    // Spawn swarm38 task run detached — same pattern as cmd:core:content-pipeline
+    const proc = spawn(
+      'swarm38',
+      ['task', 'run', '--flow-id', FLOW_ID, '--registry', REGISTRY, '--input-json', inputJson],
+      {
+        detached: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        env: { ...process.env, HOME: '/home/shanks' },
+      }
+    )
+    proc.stdin!.write('\n')
+    proc.stdin!.end()
+    proc.unref()
 
-    // Fire and forget — pipeline runs for 30-60 min, frontend polls independently
-    exec(cmd, { timeout: 90 * 60 * 1000 }, (err) => {
-      if (err) console.error('[sales-pipeline/run] CLI error:', err.message)
-      else console.log('[sales-pipeline/run] CLI completed')
-    })
+    // Wait for the task to be registered
+    await new Promise(r => setTimeout(r, 2500))
 
-    // Wait for CLI to register the task
-    await new Promise(r => setTimeout(r, 2000))
-
-    // Return the newly created task ID
+    // Fetch the newly created task
     const allTasks = await swarmGet<Array<{ id: string; name: string; status: string; created_at: string }>>(
       '/api/tasks'
     )
     const latest = allTasks
-      .filter(t => t.name === FLOW_ID && (t.status === 'open' || t.status === 'pending' || t.status === 'running'))
+      .filter(t => t.name === FLOW_ID)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+
+    // Resolve flow session ID
+    let flowSessionId: string | null = null
+    if (latest?.id) {
+      try {
+        const fsRes = await fetch(`${SWARM_BASE}/api/flow-session-id/${latest.id}`, { cache: 'no-store' })
+        if (fsRes.ok) {
+          const fsData = await fsRes.json() as { flow_session_id?: string }
+          flowSessionId = fsData.flow_session_id ?? null
+        }
+      } catch {}
+    }
 
     return NextResponse.json({
       taskId: latest?.id ?? null,
+      flowSessionId,
       profileBuilderTaskId: pbTask.id,
-      message: 'Sales pipeline started via CLI',
+      message: 'Sales pipeline started',
     })
   } catch (err) {
     console.error('[sales-pipeline/run] error:', err)
